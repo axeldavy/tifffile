@@ -5,7 +5,10 @@
 import re
 import sys
 
+from Cython.Build import cythonize
+import numpy as np
 from setuptools import setup
+from setuptools.extension import Extension
 
 buildnumber = ''
 
@@ -84,6 +87,63 @@ if 'sdist' in sys.argv:
         fh.write(revisions.strip())
         fh.write(old)
 
+extensions = [
+    Extension(
+        "tifffile.files",
+        ["tifffile/files.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),
+    Extension(
+        "tifffile.format",
+        ["tifffile/format.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),
+    Extension(
+        "tifffile.names",
+        ["tifffile/names.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),
+    Extension(
+        "tifffile.tags",
+        ["tifffile/tags.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),
+    Extension(
+        "tifffile.types",
+        ["tifffile/types.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),
+    Extension(
+        "tifffile.utils",
+        ["tifffile/utils.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O1'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    )
+]
+
 setup(
     name='tifffile',
     version=version,
@@ -106,6 +166,12 @@ setup(
         'numpy',
         # 'imagecodecs>=2023.8.12',
     ],
+    ext_modules = \
+        cythonize(
+            extensions,
+            compiler_directives={'language_level' : "3"},
+            nthreads=4
+        ),
     extras_require={
         'codecs': ['imagecodecs>=2024.12.30'],
         'xml': ['defusedxml', 'lxml'],

@@ -1,3 +1,11 @@
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+# cython: cdivision=True
+# cython: nonecheck=False
+# cython: profile=True
+# distutils: language=c++
+
 from libc.stdint cimport int32_t
 
 

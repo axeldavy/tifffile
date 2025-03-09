@@ -925,6 +925,10 @@ from datetime import datetime as DateTime
 from datetime import timedelta as TimeDelta
 from functools import cached_property
 
+from .format import TiffFormat
+from .files import FileHandle, FileSequence, TiffSequence
+from .tags import TiffTag, TiffTags, TiffTagRegistry
+
 import numpy
 
 try:
@@ -1703,10 +1707,13 @@ class TiffWriter:
         elif byteorder not in {'<', '>'}:
             raise ValueError(f'invalid byteorder {byteorder}')
 
-        if byteorder == '<':
-            self.tiff = TIFF.BIG_LE if bigtiff else TIFF.CLASSIC_LE
-        else:
-            self.tiff = TIFF.BIG_BE if bigtiff else TIFF.CLASSIC_BE
+        #if byteorder == '<':
+        #    self.tiff = TIFF.BIG_LE if bigtiff else TIFF.CLASSIC_LE
+        #else:
+        #    self.tiff = TIFF.BIG_BE if bigtiff else TIFF.CLASSIC_BE
+        _o = fh.tell()
+        self.tiff = TiffFormat.detect_format(fh.read_at(0, 32))
+        fh.seek(_o)
 
         self._truncate = False
         self._metadata = None
@@ -2110,7 +2117,7 @@ class TiffWriter:
         numstrips: int
 
         fh = self._fh
-        byteorder = self.tiff.byteorder
+        byteorder = self.tiff.byteorder_str
 
         if data is None:
             # empty
@@ -4061,7 +4068,7 @@ class TiffWriter:
     def _pack(self, fmt: str, *val: Any) -> bytes:
         """Return values packed to bytes according to format."""
         if fmt[0] not in '<>':
-            fmt = self.tiff.byteorder + fmt
+            fmt = self.tiff.byteorder_str + fmt
         return struct.pack(fmt, *val)
 
     def _bytecount_format(
@@ -4246,7 +4253,7 @@ class TiffFile:
             self._omexml = omexml
             self.is_ome = True
 
-        fh = FileHandle(file, mode=mode, name=name, offset=offset, size=size)
+        fh = FileHandle(file)#, mode=mode, name=name, offset=offset, size=size)
         self._fh = fh
         self._multifile = True if _multifile is None else bool(_multifile)
         self._files = {fh.name: self}
@@ -4302,7 +4309,9 @@ class TiffFile:
                     self.tiff = TIFF.CLASSIC_LE
             else:
                 raise TiffFileError(f'invalid TIFF version {version}')
-
+            _o = fh.tell()
+            self.tiff = TiffFormat.detect_format(fh.read_at(0, 32))
+            fh.seek(_o)
             # file handle is at offset to offset to first page
             self.pages = TiffPages(self)
 
@@ -4341,7 +4350,7 @@ class TiffFile:
     @property
     def byteorder(self) -> Literal['>', '<']:
         """Byteorder of TIFF file."""
-        return self.tiff.byteorder
+        return self.tiff.byteorder_str
 
     @property
     def filehandle(self) -> FileHandle:
@@ -7320,7 +7329,7 @@ class TiffFile:
 
 
 @final
-class TiffFormat:
+class TiffFormat_:
     """TIFF format properties."""
 
     __slots__ = (
@@ -7620,7 +7629,7 @@ class TiffPage:
             tagdata = data[tagindex : tagindex + tagsize]
             try:
                 tag = TiffTag.fromfile(
-                    parent, offset=tagoffset + i * tagsize_, header=tagdata
+                    parent._fh, parent.tiff, offset=tagoffset + i * tagsize_, header=tagdata
                 )
             except TiffFileError as exc:
                 logger().error(f'<TiffTag.fromfile> raised {exc!r:.128}')
@@ -7755,7 +7764,7 @@ class TiffPage:
             try:
                 tag.value = read_uic1tag(
                     fh,
-                    tiff.byteorder,
+                    tiff.byteorder_str,
                     tag.dtype,
                     tag.count,
                     0,
@@ -7773,7 +7782,7 @@ class TiffPage:
                 tag.value = imagej_metadata(
                     tag.value,
                     tags[50838].value,  # IJMetadataByteCounts
-                    tiff.byteorder,
+                    tiff.byteorder_str,
                 )
             except Exception as exc:
                 logger().warning(
@@ -8639,9 +8648,9 @@ class TiffPage:
             for segment in fh.read_segments(
                 self.dataoffsets,
                 self.databytecounts,
-                lock=lock,
+                #lock=lock,
                 sort=sort,
-                buffersize=buffersize,
+                buffersize=-1 if buffersize is None else buffersize,
                 flat=True,
             ):
                 yield decode(segment)
@@ -8653,9 +8662,9 @@ class TiffPage:
                 for segments in fh.read_segments(
                     self.dataoffsets,
                     self.databytecounts,
-                    lock=lock,
+                    #lock=lock,
                     sort=sort,
-                    buffersize=buffersize,
+                    buffersize=-1 if buffersize is None else buffersize,
                     flat=False,
                 ):
                     yield from executor.map(decode, segments)
@@ -10181,7 +10190,8 @@ class TiffFrame:
                     continue
                 try:
                     tag = TiffTag.fromfile(
-                        self.parent,
+                        self.parent._fh,
+                        self.parent.tiff,
                         offset=tagoffset + tagindex,
                         header=tagbytes[tagindex : tagindex + tagsize],
                     )
@@ -11079,7 +11089,7 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
 
 
 @final
-class TiffTag:
+class TiffTag_:
     """TIFF tag structure.
 
     TiffTag instances are not thread-safe. All attributes are read-only.
@@ -11249,7 +11259,7 @@ class TiffTag:
             value = struct.unpack('<Q', value)
         else:
             fmt = (
-                f'{tiff.byteorder}'
+                f'{tiff.byteorder_str}'
                 f'{count * int(valueformat[0])}'
                 f'{valueformat[1]}'
             )
@@ -11279,7 +11289,7 @@ class TiffTag:
             ) from exc
 
         fh = parent.filehandle
-        byteorder = parent.tiff.byteorder
+        byteorder = parent.tiff.byteorder_str
         offsetsize = parent.tiff.offsetsize
 
         valuesize = count * struct.calcsize(valueformat)
@@ -11444,7 +11454,7 @@ class TiffTag:
             tiff = self.parent.tiff
             dataformat = TIFF.DATA_FORMATS[self.dtype]
             count = self.count * int(dataformat[0])
-            fmt = f'{tiff.byteorder}{count}{dataformat[1]}'
+            fmt = f'{tiff.byteorder_str}{count}{dataformat[1]}'
             try:
                 if self.dtype == 2:
                     # ASCII
@@ -11589,7 +11599,7 @@ class TiffTag:
 
         if packedvalue is None:
             packedvalue = struct.pack(
-                f'{tiff.byteorder}{count * int(dataformat[0])}{dataformat[1]}',
+                f'{tiff.byteorder_str}{count * int(dataformat[0])}{dataformat[1]}',
                 *value,
             )
         newsize = len(packedvalue)
@@ -11601,7 +11611,7 @@ class TiffTag:
             if dtype != self.dtype:
                 # rewrite data type
                 fh.seek(self.offset + 2)
-                fh.write(struct.pack(tiff.byteorder + 'H', dtype))
+                fh.write(struct.pack(tiff.byteorder_str + 'H', dtype))
 
             if oldsize <= tiff.tagoffsetthreshold:
                 if newsize <= tiff.tagoffsetthreshold:
@@ -11752,7 +11762,7 @@ class TiffTag:
 
 
 @final
-class TiffTags:
+class TiffTags_:
     """Multidict-like interface to TiffTag instances in TiffPage.
 
     Differences to a regular dict:
@@ -12008,7 +12018,7 @@ class TiffTags:
 
 
 @final
-class TiffTagRegistry:
+class TiffTagRegistry_:
     """Registry of TIFF tag codes and names.
 
     Map tag codes and names to names and codes respectively.
@@ -13956,7 +13966,7 @@ class ZarrFileSequenceStore(ZarrStore):
         )
 
 
-class FileSequence(Sequence[str]):
+class FileSequence_(Sequence[str]):
     r"""Sequence of files containing compatible array data.
 
     Parameters:
@@ -14322,7 +14332,7 @@ class FileSequence(Sequence[str]):
 
 
 @final
-class TiffSequence(FileSequence):
+class TiffSequence_(FileSequence_):
     r"""Sequence of TIFF files containing compatible array data.
 
     Same as :py:class:`FileSequence` with the :py:func:`imread` function,
@@ -14545,7 +14555,7 @@ class TiledSequence:
 
 
 @final
-class FileHandle:
+class FileHandle_:
     """Binary file handle.
 
     A limited, special purpose binary file handle that can:
@@ -17279,9 +17289,9 @@ class _TIFF:
     """Delay-loaded constants, accessible via :py:attr:`TIFF` instance."""
 
     @cached_property
-    def CLASSIC_LE(self) -> TiffFormat:
+    def CLASSIC_LE(self) -> TiffFormat_:
         """32-bit little-endian TIFF format."""
-        return TiffFormat(
+        return TiffFormat_(
             version=42,
             byteorder='<',
             offsetsize=4,
@@ -17295,9 +17305,9 @@ class _TIFF:
         )
 
     @cached_property
-    def CLASSIC_BE(self) -> TiffFormat:
+    def CLASSIC_BE(self) -> TiffFormat_:
         """32-bit big-endian TIFF format."""
-        return TiffFormat(
+        return TiffFormat_(
             version=42,
             byteorder='>',
             offsetsize=4,
@@ -17311,9 +17321,9 @@ class _TIFF:
         )
 
     @cached_property
-    def BIG_LE(self) -> TiffFormat:
+    def BIG_LE(self) -> TiffFormat_:
         """64-bit little-endian TIFF format."""
-        return TiffFormat(
+        return TiffFormat_(
             version=43,
             byteorder='<',
             offsetsize=8,
@@ -17327,9 +17337,9 @@ class _TIFF:
         )
 
     @cached_property
-    def BIG_BE(self) -> TiffFormat:
+    def BIG_BE(self) -> TiffFormat_:
         """64-bit big-endian TIFF format."""
-        return TiffFormat(
+        return TiffFormat_(
             version=43,
             byteorder='>',
             offsetsize=8,
@@ -17343,9 +17353,9 @@ class _TIFF:
         )
 
     @cached_property
-    def NDPI_LE(self) -> TiffFormat:
+    def NDPI_LE(self) -> TiffFormat_:
         """32-bit little-endian TIFF format with 64-bit offsets."""
-        return TiffFormat(
+        return TiffFormat_(
             version=42,
             byteorder='<',
             offsetsize=8,  # NDPI uses 8 bytes IFD and tag offsets

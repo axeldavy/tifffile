@@ -1,33 +1,233 @@
-# cython: language_level=3
-# cython: boundscheck=False
-# cython: wraparound=False
-# cython: cdivision=True
-# cython: nonecheck=False
+#cython: language_level=3
+#cython: boundscheck=True
+#cython: wraparound=True
+#cython: cdivision=True
+#cython: nonecheck=False
+#cython: profile=True
+#distutils: language=c++
 
-import os
+
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import io
+import glob
+import os
+import re
 import threading
 import warnings
-from collection import OrderedDict
 
-from typing import Any, IO, Literal, Sequence, cast
+#from .series import TiledSequence
+from .types import TIFF
+from .utils import create_output, natural_sorted, snipstr
+#from .zarr import ZarrFileSequenceStore
+
 from cpython.buffer cimport PyBUF_SIMPLE, PyBuffer_FillInfo
+from cpython.bytes cimport PyBytes_AsString
 from libc.stdlib cimport malloc, free, realloc
 from libc.string cimport memcpy
+from .utils cimport lock_gil_friendly, product, recursive_mutex, unique_lock
 import numpy as np
-cimport numpy as np
+#cimport numpy as np
+cimport cython
 
-np.import_array()
+#np.import_array()
 
-# Define the NullContext class
-class NullContext:
+def FILE_PATTERNS(self) -> dict[str, str]:
+        # predefined FileSequence patterns
+        return {
+            'axes': r"""(?ix)
+                # matches Olympus OIF and Leica TIFF series
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                _?(?:(q|l|p|a|c|t|x|y|z|ch|tp)(\d{1,4}))?
+                """
+        }
+
+def parse_filenames(
+    files: Sequence[str],
+    /,
+    pattern: str | None = None,
+    axesorder: Sequence[int] | None = None,
+    categories: dict[str, dict[str, int]] | None = None,
+    *,
+    _shape: Sequence[int] | None = None,
+) -> tuple[
+    tuple[str, ...], tuple[int, ...], list[tuple[int, ...]], Sequence[str]
+]:
+    r"""Return shape and axes from sequence of file names matching pattern.
+
+    Parameters:
+        files:
+            Sequence of file names to parse.
+        pattern:
+            Regular expression pattern matching axes names and chunk indices
+            in file names.
+            By default, no pattern matching is performed.
+            Axes names can be specified by matching groups preceding the index
+            groups in the file name, be provided as group names for the index
+            groups, or be omitted.
+            The predefined 'axes' pattern matches Olympus OIF and Leica TIFF
+            series.
+        axesorder:
+            Indices of axes in pattern. By default, axes are returned in the
+            order they appear in pattern.
+        categories:
+            Map of index group matches to integer indices.
+            `{'axislabel': {'category': index}}`
+        _shape:
+            Shape of file sequence. The default is
+            `maximum - minimum + 1` of the parsed indices for each dimension.
+
+    Returns:
+        - Axes names for each dimension.
+        - Shape of file series.
+        - Index of each file in shape.
+        - Filtered sequence of file names.
+
+    Examples:
+        >>> parse_filenames(
+        ...     ['c1001.ext', 'c2002.ext'], r'([^\d])(\d)(?P<t>\d+)\.ext'
+        ... )
+        (('c', 't'), (2, 2), [(0, 0), (1, 1)], ['c1001.ext', 'c2002.ext'])
+
+    """
+    # TODO: add option to filter files that do not match pattern
+
+    shape = None if _shape is None else tuple(_shape)
+    if pattern is None:
+        if shape is not None and (len(shape) != 1 or shape[0] < len(files)):
+            raise ValueError(
+                f'shape {(len(files),)} does not fit provided shape {shape}'
+            )
+        return (
+            ('I',),
+            (len(files),),
+            [(i,) for i in range(len(files))],
+            files,
+        )
+
+    pattern = FILE_PATTERNS().get(pattern, pattern)
+    if not pattern:
+        raise ValueError('invalid pattern')
+    if isinstance(pattern, str):
+        pattern_compiled = re.compile(pattern)
+    elif hasattr(pattern, 'groupindex'):
+        pattern_compiled = pattern
+    else:
+        raise ValueError('invalid pattern')
+
+    if categories is None:
+        categories = {}
+
+    def parse(fname: str, /) -> tuple[tuple[str, ...], tuple[int, ...]]:
+        # return axes names and indices from file name
+        assert categories is not None
+        dims: list[str] = []
+        indices: list[int] = []
+        groupindex = {v: k for k, v in pattern_compiled.groupindex.items()}
+        match = pattern_compiled.search(fname)
+        if match is None:
+            raise ValueError(f'pattern does not match file name {fname!r}')
+        ax = None
+        for i, m in enumerate(match.groups()):
+            if m is None:
+                continue
+            if i + 1 in groupindex:
+                ax = groupindex[i + 1]
+            elif m[0].isalpha():
+                ax = m  # axis label for next index
+                continue
+            if ax is None:
+                ax = 'Q'  # no preceding axis letter
+            try:
+                if ax in categories:
+                    m = categories[ax][m]
+                m = int(m)
+            except Exception as exc:
+                raise ValueError(f'invalid index {m!r}') from exc
+            indices.append(m)
+            dims.append(ax)
+            ax = None
+        return tuple(dims), tuple(indices)
+
+    normpaths = [os.path.normpath(f) for f in files]
+    if len(normpaths) == 1:
+        prefix_str = os.path.dirname(normpaths[0])
+    else:
+        prefix_str = os.path.commonpath(normpaths)
+    prefix = len(prefix_str)
+
+    dims: tuple[str, ...] | None = None
+    indices: list[tuple[int, ...]] = []
+    for fname in normpaths:
+        lbl, idx = parse(fname[prefix:])
+        if dims is None:
+            dims = lbl
+            if axesorder is not None and (
+                len(axesorder) != len(dims)
+                or any(i not in axesorder for i in range(len(dims)))
+            ):
+                raise ValueError(
+                    f'invalid axesorder {axesorder!r} for {dims!r}'
+                )
+        elif dims != lbl:
+            raise ValueError('dims do not match within image sequence')
+        if axesorder is not None:
+            idx = tuple(idx[i] for i in axesorder)
+        indices.append(idx)
+
+    assert dims is not None
+    if axesorder is not None:
+        dims = tuple(dims[i] for i in axesorder)
+
+    # determine shape
+    indices_array = np.array(indices, dtype=np.intp)
+    parsedshape = np.max(indices, axis=0)
+
+    if shape is None:
+        startindex = np.min(indices_array, axis=0)
+        indices_array -= startindex
+        parsedshape -= startindex
+        parsedshape += 1
+        shape = tuple(int(i) for i in parsedshape.tolist())
+    elif len(parsedshape) != len(shape) or any(
+        i > j for i, j in zip(shape, parsedshape)
+    ):
+        raise ValueError(
+            f'parsed shape {parsedshape} does not fit provided shape {shape}'
+        )
+
+    indices_list: list[list[int]]
+    indices_list = indices_array.tolist()  # type: ignore[assignment]
+    indices = [tuple(index) for index in indices_list]
+
+    return dims, shape, indices, files
+
+@cython.final
+cdef class FileHandleLock:
+    """
+    A context manager that links to the FileHandler internal mutex
+    """
+
+    cdef FileHandle _filehandle
+    cdef unique_lock[recursive_mutex] m
+
+    def __cinit__(self, FileHandle filehandle):
+        self._filehandle = filehandle
+
     def __enter__(self):
-        return None
-    
+        assert not self.m.owns_lock()
+        lock_gil_friendly(self.m, self._filehandle._mutex)
+
     def __exit__(self, exc_type, exc_value, traceback):
-        pass
+        assert self.m.owns_lock()
+        self.m.unlock()
 
-
+@cython.final
 cdef class FileHandle:
     """Binary file handle.
 
@@ -61,7 +261,6 @@ cdef class FileHandle:
     """
     
     def __cinit__(self):
-        self._buffer = NULL
         self._read_cache = OrderedDict()
         self._max_cache_len = 10 # max 10 chunks in cache
         self._chunk_size = 4096 # 4 KB default chunk size for buffered reading
@@ -69,26 +268,27 @@ cdef class FileHandle:
     def __init__(
         self,
         file,
-        mode=None,
+        mode='rb',
         *,
-        name=None,
-        offset=None,
-        size=None,
+        name='',
+        offset=-1,
+        size=-1,
     ):
-        self._mode = 'rb' if mode is None else mode
+        self._mode = mode
         self._fh = None
         self._file = file  # reference to original argument for re-opening
-        self._name = name if name else ''
+        self._name = name 
         self._dir = ''
-        self._offset = -1 if offset is None else offset
-        self._size = -1 if size is None else size
+        self._global_offset = offset
+        self._size = size
         self._close = True
-        self._lock = NullContext()
         self.open()
         assert self._fh is not None
 
-    cpdef void open(self) except *:
+    cpdef void open(self):
         """Open or re-open file."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         if self._fh is not None:
             return  # file is open
 
@@ -105,17 +305,17 @@ cdef class FileHandle:
             self._dir, self._name = os.path.split(self._file)
             self._fh = open(self._file, self._mode, encoding=None)
             self._close = True
-            self._offset = max(0, self._offset)
+            self._global_offset = max(0, self._global_offset)
         elif isinstance(self._file, FileHandle):
             # FileHandle
             self._fh = self._file._fh
-            self._offset = max(0, self._offset)
-            self._offset += self._file._offset
+            self._global_offset = max(0, self._global_offset)
+            self._global_offset += self._file._offset
             self._close = False
             if not self._name:
-                if self._offset:
+                if self._global_offset:
                     name, ext = os.path.splitext(self._file._name)
-                    self._name = f'{name}@{self._offset}{ext}'
+                    self._name = f'{name}@{self._global_offset}{ext}'
                 else:
                     self._name = self._file._name
             self._mode = self._file._mode
@@ -128,8 +328,8 @@ cdef class FileHandle:
             except Exception as exc:
                 raise ValueError('binary stream is not seekable') from exc
 
-            if self._offset < 0:
-                self._offset = self._fh.tell()
+            if self._global_offset < 0:
+                self._global_offset = self._fh.tell()
             self._close = False
             if not self._name:
                 try:
@@ -156,8 +356,8 @@ cdef class FileHandle:
                     pass
                 raise ValueError('OpenFile is not seekable') from exc
 
-            if self._offset < 0:
-                self._offset = self._fh.tell()
+            if self._global_offset < 0:
+                self._global_offset = self._fh.tell()
             self._close = True
             if not self._name:
                 try:
@@ -178,17 +378,19 @@ cdef class FileHandle:
 
         assert self._fh is not None
 
-        if self._offset:
-            self._fh.seek(self._offset)
+        if self._global_offset:
+            self._fh.seek(self._global_offset)
 
         if self._size < 0:
             pos = self._fh.tell()
-            self._fh.seek(self._offset, os.SEEK_END)
+            self._fh.seek(self._global_offset, os.SEEK_END)
             self._size = self._fh.tell()
             self._fh.seek(pos)
 
-    cpdef void close(self) except *:
+    cpdef void close(self):
         """Close file handle."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         if self._close and self._fh is not None:
             try:
                 self._fh.close()
@@ -197,8 +399,10 @@ cdef class FileHandle:
                 pass
             self._fh = None
 
-    cpdef int fileno(self) except *:
+    cpdef int64_t fileno(self):
         """Return underlying file descriptor if exists, else raise OSError."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
         try:
             return self._fh.fileno()
@@ -207,51 +411,80 @@ cdef class FileHandle:
                 f'{type(self._fh)} does not have a file descriptor'
             ) from exc
 
-    cpdef bint writable(self) except *:
+    cpdef bint writable(self):
         """Return True if stream supports writing."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
         if hasattr(self._fh, 'writable'):
             return self._fh.writable()
         return False
 
-    cpdef bint seekable(self) except *:
+    cpdef bint seekable(self):
         """Return True if stream supports random access."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return True
 
-    cpdef int tell(self) except *:
+    cpdef int64_t tell(self):
         """Return file's current position."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
-        return self._fh.tell() - self._offset
+        return self._current_offset - self._global_offset
+
+    cdef int64_t _seek(self, int64_t offset, int64_t whence):
+        """Actually seek the underlying file"""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        if offset == self._actual_position and whence == 0:
+            return self._actual_position
+        self._actual_position = self._fh.seek(offset, whence)
+        return self._actual_position
+
+    cdef bytes _actual_read(self, int64_t offset, int64_t size):
+        """Read with no caching"""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        self._seek(offset, 0)
+        if offset + size > self._size:
+            size = self.size - offset
+        if size <= 0:
+            return b""
+        self._actual_position += size
+        return self._fh.read(size)
 
     cdef bytes _read(self, int64_t offset, int64_t size):
         """Read and cache (if read is not too large) the requested data"""
         # Do not use cache for large reads
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         if size > self._chunk_size:
-            self._fh.seek(offset, 0)
-            return self._fh.read(size)
+            return self._actual_read(offset, size)
 
-        cdef int chunk_id_start = offset // self._chunk_size
-        cdef int chunk_id_end = (offset+size) // self.chunk_size
+        cdef int64_t chunk_id_start = offset // self._chunk_size
+        cdef int64_t chunk_id_end = (offset+size) // self._chunk_size
         assert (chunk_id_start == chunk_id_end
                 or chunk_id_start == chunk_id_end - 1)
 
         cdef bytes chunk1, chunk2
-        cdef bint chunk1_loaded = False
         # load the chunks in cache if needed
         if chunk_id_start not in self._read_cache:
-            self._fh.seek(chunk_id_start * self.chunk_size, 0)
-            chunk1 = self._fh.read(self.chunk_size)
+            chunk1 = self._actual_read(
+                chunk_id_start * self._chunk_size,
+                self._chunk_size
+            )
             self._read_cache[chunk_id_start] = chunk1
-            chunk1_loaded = True
         else:
             chunk1 = self._read_cache[chunk_id_start]
             self._read_cache.move_to_end(chunk_id_start)
 
         if (chunk_id_start != chunk_id_end and
             chunk_id_end not in self._read_cache):
-            if not chunk1_loaded:
-                self._fh.seek(chunk_id_end * self.chunk_size, 0)
-            chunk2 = self._fh.read(self.chunk_size)
+            chunk2 = self._actual_read(
+                chunk_id_end * self._chunk_size,
+                self._chunk_size
+            )
             self._read_cache[chunk_id_end] = chunk2
         else:
             chunk2 = self._read_cache[chunk_id_end]
@@ -263,13 +496,13 @@ cdef class FileHandle:
 
         # Concatenate the chunks
         if chunk_id_start == chunk_id_end:
-            return chunk1[offset % self.chunk_size:offset % self.chunk_size+size]
+            return chunk1[offset % self._chunk_size:offset % self._chunk_size+size]
         else:
-            return (chunk1[offset % self.chunk_size:] +
-                    chunk2[:size - (offset % self.chunk_size)])
+            return (chunk1[offset % self._chunk_size:] +
+                    chunk2[:size - (offset % self._chunk_size)])
 
 
-    cpdef int seek(self, int offset, int whence=0) except *:
+    cpdef int64_t seek(self, int64_t offset, int64_t whence=0):
         """Set file's current position.
 
         Parameters:
@@ -283,20 +516,23 @@ cdef class FileHandle:
                 2 (`os.SEEK_END`) end of file.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
-        if self._offset:
+        cdef int64_t target_offset = offset
+        if self._global_offset > 0:
             if whence == 0:
-                return (
-                    self._fh.seek(self._offset + offset, whence) - self._offset
-                )
-            if whence == 2 and self._size > 0:
-                return (
-                    self._fh.seek(self._offset + self._size + offset, 0)
-                    - self._offset
-                )
-        return self._fh.seek(offset, whence)
+                target_offset += self._global_offset
+            elif whence == 2:
+                target_offset += self._global_offset + self._size
+        if whence == 0 and target_offset < 0:
+            target_offset = 0
+        elif whence == 2 and target_offset > self._size:
+            target_offset = self._size
+        self._current_offset = target_offset
+        return target_offset - self._global_offset
 
-    cpdef bytes read(self, int size=-1) except *:
+    cpdef bytes read(self, int64_t size=-1):
         """Return bytes read from file.
 
         Parameters:
@@ -305,12 +541,42 @@ cdef class FileHandle:
                 By default, read until the end of the file.
 
         """
-        if size < 0 and self._offset:
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        if size < 0 and self._global_offset > 0:
             size = self._size
         assert self._fh is not None
-        return self._fh.read(size)
+        cdef int64_t current_pos = self.tell()
+        cdef bytes result = self._read(self._current_offset, size)
+        self.seek(current_pos+len(result), 0)
+        return result
 
-    cpdef int readinto(self, bytes buffer) except *:
+    cpdef bytes read_at(self, int64_t offset, int64_t size):
+        """Return bytes read from file at offset.
+
+        It is equivalent to
+        self.seek(offset)
+        self.read(size)
+
+        except that the file lock is held for the
+        entire operation.
+
+        Parameters:
+            offset:
+                Position in file to start reading from.
+            size:
+                Number of bytes to read from file.
+
+        """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        assert self._fh is not None
+        self.seek(offset, 0)
+        cdef bytes result = self._read(self._current_offset, size)
+        self.seek(offset+len(result), 0)
+        return result
+
+    cpdef int64_t readinto(self, buffer):
         """Read bytes from file into buffer.
 
         Parameters:
@@ -320,10 +586,16 @@ cdef class FileHandle:
             Number of bytes read from file.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
-        return self._fh.readinto(buffer)  # type: ignore[attr-defined]
+        cdef bytes content = self._read(self._current_offset, len(buffer))
+        cdef int64_t n = len(content)
+        cdef char[::1] dst = buffer
+        memcpy(&dst[0], PyBytes_AsString(content), n)
+        return n
 
-    cpdef int write(self, bytes buffer) except *:
+    cpdef int64_t write(self, bytes buffer):
         """Write bytes to file and return number of bytes written.
 
         Parameters:
@@ -333,23 +605,34 @@ cdef class FileHandle:
             Number of bytes written.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
+        # invalidate cache
+        self._read_cache.clear()
+        # resolve position
+        self._seek(self._current_offset, 0)
+        if self.tell() + len(buffer) > self._size:
+            self._size = self.tell() + len(buffer)
+        # perform write
         return self._fh.write(buffer)
 
-    cpdef void flush(self) except *:
+    cpdef void flush(self):
         """Flush write buffers of stream if applicable."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
         if hasattr(self._fh, 'flush'):
             self._fh.flush()
 
-    cpdef np.ndarray memmap_array(
+    cpdef object memmap_array(
         self,
-        dtype,
-        shape,
-        int offset=0,
+        object dtype,
+        tuple shape,
+        int64_t offset=0,
         str mode='r',
         str order='C',
-    ) except *:
+    ):
         """Return `numpy.memmap` of array data stored in file.
 
         Parameters:
@@ -365,6 +648,8 @@ cdef class FileHandle:
                 Order of ndarray memory layout. The default is 'C'.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         if not self.is_file:
             raise ValueError('cannot memory-map file without fileno')
         assert self._fh is not None
@@ -372,18 +657,18 @@ cdef class FileHandle:
             self._fh,  # type: ignore[call-overload]
             dtype=dtype,
             mode=mode,
-            offset=self._offset + offset,
+            offset=self._global_offset + offset,
             shape=shape,
             order=order,
         )
 
-    cpdef np.ndarray read_array(
+    cpdef object read_array(
         self,
         dtype,
-        int count=-1,
-        int offset=0,
+        int64_t count=-1,
+        int64_t offset=0,
         out=None,
-    ) except *:
+    ):
         """Return NumPy array from file in native byte order.
 
         Parameters:
@@ -397,7 +682,10 @@ cdef class FileHandle:
                 NumPy array to read into. By default, a new array is created.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         dtype = np.dtype(dtype)
+        cdef int64_t n, nbytes
 
         if count < 0:
             nbytes = self._size if out is None else out.nbytes
@@ -412,13 +700,12 @@ cdef class FileHandle:
 
         assert self._fh is not None
 
-        if offset:
-            self._fh.seek(self._offset + offset)
+        self.seek(offset, 0)
 
         try:
-            n = self._fh.readinto(result)  # type: ignore[attr-defined]
+            n = self.readinto(result)
         except AttributeError:
-            result[:] = np.frombuffer(self._fh.read(nbytes), dtype).reshape(
+            result[:] = np.frombuffer(self.read(nbytes), dtype).reshape(
                 result.shape
             )
             n = nbytes
@@ -439,12 +726,12 @@ cdef class FileHandle:
 
         return result
 
-    cpdef np.recarray read_record(
+    cpdef object read_record(
         self,
         dtype,
         shape=1,
         byteorder=None,
-    ) except *:
+    ):
         """Return NumPy record from file.
 
         Parameters:
@@ -456,6 +743,8 @@ cdef class FileHandle:
                 Byte order of record array to read.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
 
         dtype = np.dtype(dtype)
@@ -469,12 +758,12 @@ cdef class FileHandle:
         except Exception:
             if shape is None:
                 shape = self._size // dtype.itemsize
-            size = product(sequence(shape)) * dtype.itemsize
+            size = product(shape) * dtype.itemsize
             # data = bytearray(size)
             # n = self._fh.readinto(data)
             # data = data[:n]
             # TODO: record is not writable
-            data = self._fh.read(size)
+            data = self.read(size)
             record = np.rec.fromstring(
                 data,
                 dtype,
@@ -482,54 +771,55 @@ cdef class FileHandle:
             )
         return record[0] if shape == 1 else record
 
-    cpdef int write_empty(self, int size) except *:
+    cpdef int64_t write_empty(self, int64_t size):
         """Append null-bytes to file.
-
-        The file position must be at the end of the file.
 
         Parameters:
             size: Number of null-bytes to write to file.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         if size < 1:
             return 0
         assert self._fh is not None
-        self._fh.seek(size - 1, os.SEEK_CUR)
-        self._fh.write(b'\x00')
+        self.seek(self._size, 0)
+        self.write(b'\x00' * size)
         return size
 
-    cpdef int write_array(
+    cpdef int64_t write_array(
         self,
-        np.ndarray data,
+        data,
         dtype=None,
-    ) except *:
+    ):
         """Write NumPy array to file in C contiguous order.
 
         Parameters:
             data: Array to write to file.
 
         """
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         assert self._fh is not None
-        pos = self._fh.tell()
+        pos = self.tell()
         # writing non-contiguous arrays is very slow
         data = np.ascontiguousarray(data, dtype)
         try:
             data.tofile(self._fh)
         except io.UnsupportedOperation:
             # numpy cannot write to BytesIO
-            self._fh.write(data.tobytes())
-        return self._fh.tell() - pos
+            self.write(data.tobytes())
+        return self.tell() - pos
 
-    cpdef read_segments(
+    def read_segments(
         self,
-        Sequence[int] offsets,
-        Sequence[int] bytecounts,
+        offsets,
+        bytecounts,
         indices=None,
         bint sort=True,
-        lock=None,
-        buffersize=None,
+        int64_t buffersize=-1,
         bint flat=True,
-    ) except *:
+    ):
         """Return iterator over segments read from file and their indices.
 
         The purpose of this function is to
@@ -550,8 +840,6 @@ cdef class FileHandle:
                 The default is `range(len(offsets))`.
             sort:
                 Read segments from file in order of their offsets.
-            lock:
-                Reentrant lock to synchronize seeks and reads.
             buffersize:
                 Approximate number of bytes to read from file in one pass.
                 The default is :py:attr:`_TIFF.BUFFERSIZE`.
@@ -565,27 +853,23 @@ cdef class FileHandle:
             Individual or lists of `(segment, index)` tuples.
 
         """
-        # TODO: Cythonize this?
         assert self._fh is not None
+        cdef int64_t i, j, offset, bytecount, length, index
+        cdef int64_t size, start, stop
+
         length = len(offsets)
         if length < 1:
             return
         if length == 1:
             index = 0 if indices is None else indices[0]
             if bytecounts[index] > 0 and offsets[index] > 0:
-                if lock is None:
-                    lock = self._lock
-                with lock:
-                    self.seek(offsets[index])
-                    data = self._fh.read(bytecounts[index])
+                data = self.read_at(offsets[index], bytecounts[index])
             else:
                 data = None
             yield (data, index) if flat else [(data, index)]
             return
 
-        if lock is None:
-            lock = self._lock
-        if buffersize is None:
+        if buffersize < 0:
             buffersize = TIFF.BUFFERSIZE
 
         if indices is None:
@@ -607,8 +891,6 @@ cdef class FileHandle:
                 iscontig = False
                 break
 
-        seek = self.seek
-        read = self._fh.read
         result = []
 
         if iscontig:
@@ -629,9 +911,7 @@ cdef class FileHandle:
                 if offset < 0:
                     data = None
                 else:
-                    with lock:
-                        seek(offset)
-                        data = read(bytecount)
+                    data = self.read_at(offset, bytecount)
                 start = 0
                 stop = 0
                 result = []
@@ -653,22 +933,24 @@ cdef class FileHandle:
             return
 
         i = 0
+        cdef unique_lock[recursive_mutex] m
         while i < length:
             result = []
             size = 0
-            with lock:
-                while size <= buffersize and i < length:
-                    index, offset, bytecount = segments[i]
-                    if offset > 0 and bytecount > 0:
-                        seek(offset)
-                        result.append((read(bytecount), index))
-                        # buffer = bytearray(bytecount)
-                        # n = fh.readinto(buffer)
-                        # data.append(buffer[:n])
-                        size += bytecount
-                    else:
-                        result.append((None, index))
-                    i += 1
+            lock_gil_friendly(m, self._mutex)
+            while size <= buffersize and i < length:
+                index, offset, bytecount = segments[i]
+                if offset > 0 and bytecount > 0:
+                    self.seek(offset)
+                    result.append((self.read(bytecount), index))
+                    # buffer = bytearray(bytecount)
+                    # n = fh.readinto(buffer)
+                    # data.append(buffer[:n])
+                    size += bytecount
+                else:
+                    result.append((None, index))
+                i += 1
+            m.unlock()
             if flat:
                 yield from result
             else:
@@ -698,21 +980,29 @@ cdef class FileHandle:
     @property
     def name(self):
         """Name of file or stream."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return self._name
 
     @property
     def dirname(self):
         """Directory in which file is stored."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return self._dir
 
     @property
     def path(self):
         """Absolute path of file."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return os.path.join(self._dir, self._name)
 
     @property
     def extension(self):
         """File name extension of file or stream."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         name, ext = os.path.splitext(self._name.lower())
         if ext and name.endswith('.ome'):
             ext = '.ome' + ext
@@ -721,42 +1011,37 @@ cdef class FileHandle:
     @property
     def size(self):
         """Size of file in bytes."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return self._size
 
     @property
     def closed(self):
         """File is closed."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return self._fh is None
-
-    @property
-    def lock(self):
-        """Reentrant lock to synchronize reads and writes."""
-        return self._lock
-
-    @lock.setter
-    def lock(self, value):
-        self.set_lock(value)
-
-    cpdef void set_lock(self, bint value) except *:
-        if bool(value) == isinstance(self._lock, NullContext):
-            self._lock = threading.RLock() if value else NullContext()
-
-    @property
-    def has_lock(self):
-        """A reentrant lock is currently used to sync reads and writes."""
-        return not isinstance(self._lock, NullContext)
 
     @property
     def is_file(self):
         """File has fileno and can be memory-mapped."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         try:
             self._fh.fileno()  # type: ignore[union-attr]
             return True
         except Exception:
             return False
 
+    @property
+    def lock(self):
+        return FileHandleLock(self)
 
-@final
+    def set_lock(bint v):
+        return
+
+
+@cython.final
 cdef class FileCache:
     """Keep FileHandles open.
 
@@ -766,7 +1051,7 @@ cdef class FileCache:
 
     """
 
-    cdef int size
+    cdef int64_t size
     """Maximum number of files to keep open."""
 
     cdef dict files
@@ -778,63 +1063,61 @@ cdef class FileCache:
     cdef list past
     """FIFO list of opened files."""
 
-    cdef object lock
-    """Reentrant lock to synchronize reads and writes."""
+    cdef recursive_mutex _mutex
 
     def __cinit__(self):
         self.past = []
         self.files = {}
         self.keep = set()
         self.size = 8
-        self.lock = NullContext()
 
     def __init__(
         self,
-        int size=None,
-        lock=None,
+        int64_t size=-1
     ):
-        if size is not None:
+        if size >= 0:
             self.size = size
-        if lock is not None:
-            self.lock = lock
 
-    cpdef void open(self, FileHandle fh) except *:
+    cpdef void open(self, FileHandle fh):
         """Open file, re-open if necessary."""
-        with self.lock:
-            if fh in self.files:
-                self.files[fh] += 1
-            elif fh.closed:
-                fh.open()
-                self.files[fh] = 1
-                self.past.append(fh)
-            else:
-                self.files[fh] = 2
-                self.keep.add(fh)
-                self.past.append(fh)
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        if fh in self.files:
+            self.files[fh] += 1
+        elif fh.closed:
+            fh.open()
+            self.files[fh] = 1
+            self.past.append(fh)
+        else:
+            self.files[fh] = 2
+            self.keep.add(fh)
+            self.past.append(fh)
 
-    cpdef void close(self, FileHandle fh) except *:
+    cpdef void close(self, FileHandle fh):
         """Close least recently used open files."""
-        with self.lock:
-            if fh in self.files:
-                self.files[fh] -= 1
-            self._trim()
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        if fh in self.files:
+            self.files[fh] -= 1
+        self._trim()
 
-    cpdef void clear(self) except *:
+    cpdef void clear(self):
         """Close all opened files if not in use when opened first."""
-        with self.lock:
-            for fh, refcount in list(self.files.items()):
-                if fh not in self.keep:
-                    fh.close()
-                    del self.files[fh]
-                    del self.past[self.past.index(fh)]
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        for fh, refcount in list(self.files.items()):
+            if fh not in self.keep:
+                fh.close()
+                del self.files[fh]
+                del self.past[self.past.index(fh)]
 
     cpdef bytes read(
         self,
         FileHandle fh,
-        int offset,
-        int bytecount,
-        int whence=0,
-    ) except *:
+        int64_t offset,
+        int64_t bytecount,
+        int64_t whence=0,
+    ):
         """Return bytes read from binary file.
 
         Parameters:
@@ -858,29 +1141,30 @@ cdef class FileCache:
         #     fh.seek()
         #     data = fh.read()
         # filecache.close(fh)
-        with self.lock:
-            b = fh not in self.files
-            if b:
-                if fh.closed:
-                    fh.open()
-                    self.files[fh] = 0
-                else:
-                    self.files[fh] = 1
-                    self.keep.add(fh)
-                self.past.append(fh)
-            fh.seek(offset, whence)
-            data = fh.read(bytecount)
-            if b:
-                self._trim()
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        b = fh not in self.files
+        if b:
+            if fh.closed:
+                fh.open()
+                self.files[fh] = 0
+            else:
+                self.files[fh] = 1
+                self.keep.add(fh)
+            self.past.append(fh)
+        fh.seek(offset, whence)
+        data = fh.read(bytecount)
+        if b:
+            self._trim()
         return data
 
-    cpdef int write(
+    cpdef int64_t write(
         self,
         FileHandle fh,
-        int offset,
+        int64_t offset,
         bytes data,
-        int whence=0,
-    ) except *:
+        int64_t whence=0,
+    ):
         """Write bytes to binary file.
 
         Parameters:
@@ -898,24 +1182,27 @@ cdef class FileCache:
                 2 (`os.SEEK_END`) end of file.
 
         """
-        with self.lock:
-            b = fh not in self.files
-            if b:
-                if fh.closed:
-                    fh.open()
-                    self.files[fh] = 0
-                else:
-                    self.files[fh] = 1
-                    self.keep.add(fh)
-                self.past.append(fh)
-            fh.seek(offset, whence)
-            written = fh.write(data)
-            if b:
-                self._trim()
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
+        b = fh not in self.files
+        if b:
+            if fh.closed:
+                fh.open()
+                self.files[fh] = 0
+            else:
+                self.files[fh] = 1
+                self.keep.add(fh)
+            self.past.append(fh)
+        fh.seek(offset, whence)
+        written = fh.write(data)
+        if b:
+            self._trim()
         return written
 
-    cpdef void _trim(self) except *:
+    cpdef void _trim(self):
         """Trim file cache."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         index = 0
         size = len(self.past)
         while index < size > self.size:
@@ -930,13 +1217,15 @@ cdef class FileCache:
 
     def __len__(self):
         """Return number of open files."""
+        cdef unique_lock[recursive_mutex] m
+        lock_gil_friendly(m, self._mutex)
         return len(self.files)
 
     def __repr__(self):
         return f'<tifffile.FileCache @0x{id(self):016X}>'
 
 
-cdef class FileSequence(Sequence):
+cdef class FileSequence:
     r"""Sequence of files containing compatible array data.
 
     Parameters:
@@ -1002,7 +1291,7 @@ cdef class FileSequence(Sequence):
         container=None,
         sort=None,
         parse=None,
-        **kwargs,
+        **kwargs
     ):
         sort_func = None
 
@@ -1082,17 +1371,17 @@ cdef class FileSequence(Sequence):
         self.shape = tuple(shape)
         self.indices = indices
 
-    cpdef np.ndarray asarray(
+    def asarray(
         self,
         imreadargs=None,
         chunkshape=None,
         chunkdtype=None,
         axestiled=None,
         out_inplace=None,
-        int ioworkers=1,
+        int64_t ioworkers=1,
         out=None,
-        **kwargs,
-    ) except *:
+        **kwargs
+    ):
         """Return images from files as NumPy array.
 
         Parameters:
@@ -1137,6 +1426,7 @@ cdef class FileSequence(Sequence):
             IndexError, ValueError: Array shapes do not match.
 
         """
+        from .tifffile import TiledSequence
         # TODO: deprecate kwargs?
         files = self._files
         if imreadargs is not None:
@@ -1147,7 +1437,7 @@ cdef class FileSequence(Sequence):
         ioworkers = min(len(files), ioworkers)
         assert isinstance(ioworkers, int)  # mypy bug?
 
-        if out_inplace is None and self.imread == imread:
+        if out_inplace is None: # TODO and self.imread == imread:
             out_inplace = True
         else:
             out_inplace = bool(out_inplace)
@@ -1218,22 +1508,23 @@ cdef class FileSequence(Sequence):
 
         return result
 
-    cpdef aszarr(self, **kwargs):
+    def aszarr(self, **kwargs):
         """Return images from files as Zarr 2 store.
 
         Parameters:
             **kwargs: Arguments passed to :py:class:`ZarrFileSequenceStore`.
 
         """
+        from .tifffile import ZarrFileSequenceStore
         return ZarrFileSequenceStore(self, **kwargs)
 
-    cpdef void close(self) except *:
+    cpdef void close(self):
         """Close open files."""
         if self._container is not None:
             self._container.close()
         self._container = None
 
-    cpdef str commonpath(self) except *:
+    cpdef str commonpath(self):
         """Return longest common sub-path of each file in sequence."""
         if len(self._files) == 1:
             commonpath = os.path.dirname(self._files[0])
@@ -1295,7 +1586,7 @@ cdef class FileSequence(Sequence):
         )
 
 
-@final
+@cython.final
 cdef class TiffSequence(FileSequence):
     r"""Sequence of TIFF files containing compatible array data.
 
@@ -1307,9 +1598,12 @@ cdef class TiffSequence(FileSequence):
     def __init__(
         self,
         files=None,
-        imread=imread,
-        **kwargs,
+        imread=None,
+        **kwargs
     ):
+        if imread is None:
+            from. import tifffile
+            imread = tifffile.imread
         super().__init__(imread, '*.tif' if files is None else files, **kwargs)
 
     def __repr__(self):

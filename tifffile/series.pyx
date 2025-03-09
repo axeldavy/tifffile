@@ -1,3 +1,9 @@
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+# cython: cdivision=True
+# cython: nonecheck=False
+# distutils: language=c++
 
 class TiffPages(Sequence[TiffPage | TiffFrame]):
     """Sequence of TIFF image file directories (IFD chain).
@@ -33,7 +39,6 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
     def __init__(
         self,
         arg: TiffFile | TiffPage | TiffFrame,
-        /,
         *,
         index: Sequence[int] | int | None = None,
     ) -> None:
@@ -209,7 +214,6 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
     def get(
         self,
         key: int,
-        /,
         default: TiffPage | TiffFrame | None = None,
         *,
         validate: int = 0,
@@ -441,7 +445,6 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
     def _getlist(
         self,
         key: int | slice | Iterable[int] | None = None,
-        /,
         useframes: bool = True,
         validate: bool = True,
     ) -> list[TiffPage | TiffFrame]:
@@ -498,7 +501,6 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
     def _getitem(
         self,
         key: int,
-        /,
         *,
         validate: int = 0,  # hash
         cache: bool = False,
@@ -689,7 +691,6 @@ class TiffPageSeries(Sequence[TiffPage | TiffFrame | None]):
     def __init__(
         self,
         pages: Sequence[TiffPage | TiffFrame | None],
-        /,
         shape: Sequence[int] | None = None,
         dtype: DTypeLike | None = None,
         axes: str | None = None,
@@ -770,7 +771,6 @@ class TiffPageSeries(Sequence[TiffPage | TiffFrame | None]):
         axes: str,
         coords: Mapping[str, NDArray[Any] | None] | None = None,
         squeeze: bool = True,
-        /,
     ) -> None:
         """Set shape, axes, and coords."""
         self._squeeze = bool(squeeze)

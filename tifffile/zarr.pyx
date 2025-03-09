@@ -25,7 +25,6 @@ class ZarrStore(MutableMapping[str, bytes]):
 
     def __init__(
         self,
-        /,
         *,
         fillvalue: int | float | None = None,
         chunkmode: CHUNKMODE | int | str | None = None,
@@ -122,7 +121,6 @@ class ZarrStore(MutableMapping[str, bytes]):
         shape: tuple[int, ...],
         dtype: DTypeLike,
         fillvalue: int | float | None,
-        /,
     ) -> NDArray[Any]:
         """Return empty chunk."""
         if fillvalue is None or fillvalue == 0:
@@ -245,7 +243,6 @@ class ZarrTiffStore(ZarrStore):
     def __init__(
         self,
         arg: TiffPage | TiffFrame | TiffPageSeries,
-        /,
         *,
         level: int | None = None,
         chunkmode: CHUNKMODE | int | str | None = None,
@@ -393,7 +390,6 @@ class ZarrTiffStore(ZarrStore):
     def write_fsspec(
         self,
         jsonfile: str | os.PathLike[Any] | TextIO,
-        /,
         url: str,
         *,
         groupname: str | None = None,
@@ -1079,7 +1075,6 @@ class ZarrFileSequenceStore(ZarrStore):
     def __init__(
         self,
         filesequence: FileSequence,
-        /,
         *,
         fillvalue: int | float | None = None,
         chunkmode: CHUNKMODE | int | str | None = None,
@@ -1166,7 +1161,6 @@ class ZarrFileSequenceStore(ZarrStore):
     def write_fsspec(
         self,
         jsonfile: str | os.PathLike[Any] | TextIO,
-        /,
         url: str,
         *,
         quote: bool | None = None,
@@ -1350,7 +1344,6 @@ class ZarrFileSequenceStore(ZarrStore):
 def zarr_selection(
     store: ZarrStore,
     selection: Any,
-    /,
     *,
     groupindex: int | None = None,
     close: bool = True,

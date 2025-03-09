@@ -1,3 +1,5 @@
+#distutils: language=c++
+
 from libc.stdint cimport int64_t, uint64_t
 
 
@@ -42,8 +44,8 @@ cdef class TiffFormat:
 
     cdef int64_t _hash
     
-    @staticmethod
-    cdef TiffFormat detect_format(bytes header)
+    #@staticmethod
+    #cdef TiffFormat detect_format(bytes header)
     """Detect appropriate TIFF format from file header."""
     
     cpdef tuple parse_tag_header(self, bytes header)

@@ -1,7 +1,16 @@
+#cython: language_level=3
+#cython: boundscheck=False
+#cython: wraparound=False
+#cython: cdivision=True
+#cython: nonecheck=False
+#cython: profile=True
+#distutils: language=c++
+
 from libc.stdint cimport int64_t, uint16_t, uint32_t, int64_t, uint64_t
 import struct
 from cpython.bytes cimport PyBytes_AS_STRING
 
+from .utils import indent
 
 cdef class TiffFormat:
     """TIFF format properties."""
@@ -90,7 +99,7 @@ cdef class TiffFormat:
             raise ValueError(f"Cannot convert {value!r} to an offset")
 
     @staticmethod
-    cdef TiffFormat detect_format(bytes header):
+    def detect_format(bytes header) -> TiffFormat:
         """Detect appropriate TIFF format from file header.
         
         Parameters

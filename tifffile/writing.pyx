@@ -103,7 +103,6 @@ class TiffWriter:
     def __init__(
         self,
         file: str | os.PathLike[Any] | FileHandle | IO[bytes],
-        /,
         *,
         mode: Literal['w', 'x', 'r+'] | None = None,
         bigtiff: bool = False,
@@ -2400,8 +2399,7 @@ class TiffWriter:
         dtype: int | str,
         count: int | None,
         value: Any,
-        writeonce: bool = False,
-        /,
+        writeonce: bool = False
     ) -> None:
         """Append (code, ifdentry, ifdvalue, writeonce) to tags list.
 

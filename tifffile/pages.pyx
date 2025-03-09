@@ -1,3 +1,10 @@
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+# cython: cdivision=True
+# cython: nonecheck=False
+# distutils: language=c++
+
 from libc.stdint cimport int32_t, int64_t
 from .types cimport DATATYPE, COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR, EXTRASAMPLE
 
@@ -132,7 +139,6 @@ cdef class TiffPage:
     def __init__(
         self,
         parent: TiffFile,
-        /,
         index: int | Sequence[int],
         *,
         keyframe: TiffPage | None = None,
@@ -721,8 +727,7 @@ cdef class TiffPage:
             def reshape(
                 data: NDArray[Any],
                 indices: tuple[int, int, int, int, int],
-                shape: tuple[int, int, int, int],
-                /,
+                shape: tuple[int, int, int, int]
             ) -> NDArray[Any]:
                 # return reshaped tile or raise TiffFileError
                 size = shape[0] * shape[1] * shape[2] * shape[3]
@@ -808,8 +813,7 @@ cdef class TiffPage:
             def reshape(
                 data: NDArray[Any],
                 indices: tuple[int, int, int, int, int],
-                shape: tuple[int, int, int, int],
-                /,
+                shape: tuple[int, int, int, int]
             ) -> NDArray[Any]:
                 # return reshaped strip or raise TiffFileError
                 size = shape[0] * shape[1] * shape[2] * shape[3]
@@ -883,7 +887,6 @@ cdef class TiffPage:
             def decode_jpeg(
                 data: bytes | None,
                 index: int,
-                /,
                 *,
                 jpegtables: bytes | None = None,
                 jpegheader: bytes | None = None,
@@ -934,7 +937,6 @@ cdef class TiffPage:
             def decode_eer(
                 data: bytes | None,
                 index: int,
-                /,
                 *,
                 jpegtables: bytes | None = None,
                 jpegheader: bytes | None = None,
@@ -968,7 +970,6 @@ cdef class TiffPage:
             def decode_jetraw(
                 data: bytes | None,
                 index: int,
-                /,
                 *,
                 jpegtables: bytes | None = None,
                 jpegheader: bytes | None = None,
@@ -1006,7 +1007,6 @@ cdef class TiffPage:
             def decode_image(
                 data: bytes | None,
                 index: int,
-                /,
                 *,
                 jpegtables: bytes | None = None,
                 jpegheader: bytes | None = None,
@@ -1102,7 +1102,6 @@ cdef class TiffPage:
         def decode_other(
             data: bytes | None,
             index: int,
-            /,
             *,
             jpegtables: bytes | None = None,
             jpegheader: bytes | None = None,
@@ -1509,7 +1508,6 @@ cdef class TiffPage:
     def _gettags(
         self,
         codes: Container[int] | None = None,
-        /,
         lock: threading.RLock | None = None,
     ) -> list[tuple[int, TiffTag]]:
         """Return list of (code, TiffTag)."""
@@ -1945,7 +1943,7 @@ cdef class TiffPage:
                 attr = name.upper()
                 break
 
-        def tostr(name: str, /, skip: int = 1) -> str:
+        def tostr(name: str, skip: int = 1) -> str:
             obj = getattr(self, name)
             if obj == skip:
                 return ''
