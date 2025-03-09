@@ -14,6 +14,8 @@ import math
 import numpy
 import re
 
+from .types import PHOTOMETRIC
+
 cdef void lock_gil_friendly_block(unique_lock[recursive_mutex] &m) noexcept:
     """
     Same as lock_gil_friendly, but blocks until the job is done.
@@ -33,6 +35,36 @@ cdef void lock_gil_friendly_block(unique_lock[recursive_mutex] &m) noexcept:
             # somehow
             m.unlock()
         locked = m.try_lock()
+
+def apply_colormap(
+    image: NDArray[Any], colormap: NDArray[Any], /, contig: bool = True
+) -> NDArray[Any]:
+    """Return palette-colored image.
+
+    The image array values are used to index the colormap on axis 1.
+    The returned image array is of shape `image.shape+colormap.shape[0]`
+    and dtype `colormap.dtype`.
+
+    Parameters:
+        image:
+            Array of indices into colormap.
+        colormap:
+            RGB lookup table aka palette of shape `(3, 2**bitspersample)`.
+        contig:
+            Return contiguous array.
+
+    Examples:
+        >>> im = numpy.arange(256, dtype='uint8')
+        >>> colormap = numpy.vstack([im, im, im]).astype('uint16') * 256
+        >>> apply_colormap(im, colormap)[-1]
+        array([65280, 65280, 65280], dtype=uint16)
+
+    """
+    image = numpy.take(colormap, image, axis=1)
+    image = numpy.rollaxis(image, 0, image.ndim)
+    if contig:
+        image = numpy.ascontiguousarray(image)
+    return image
 
 def asbool(
     value: str | bytes,
@@ -206,6 +238,46 @@ def create_output(
         out[:] = fillvalue
     return out
 
+def enumstr(enum: Any, /) -> str:
+    """Return short string representation of Enum member.
+
+    >>> enumstr(PHOTOMETRIC.RGB)
+    'RGB'
+
+    """
+    name = enum.name
+    if name is None:
+        name = str(enum)
+    return name
+
+
+def enumarg(enum: type[enum.IntEnum], arg: Any, /) -> enum.IntEnum:
+    """Return enum member from its name or value.
+
+    Parameters:
+        enum: Type of IntEnum.
+        arg: Name or value of enum member.
+
+    Returns:
+        Enum member matching name or value.
+
+    Raises:
+        ValueError: No enum member matches name or value.
+
+    Examples:
+        >>> enumarg(PHOTOMETRIC, 2)
+        <PHOTOMETRIC.RGB: 2>
+        >>> enumarg(PHOTOMETRIC, 'RGB')
+        <PHOTOMETRIC.RGB: 2>
+
+    """
+    try:
+        return enum(arg)
+    except Exception:
+        try:
+            return enum[arg.upper()]
+        except Exception as exc:
+            raise ValueError(f'invalid argument {arg!r}') from exc
 
 def hexdump(
     data: bytes,
@@ -322,6 +394,14 @@ def hexdump(
             result.append(r)
     return b'\n'.join(result).decode('ascii')
 
+def identityfunc(arg: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Single argument identity function.
+
+    >>> identityfunc('arg')
+    'arg'
+
+    """
+    return arg
 
 def indent(*args: Any) -> str:
     """Return joined string representations of objects with indented lines.
@@ -389,6 +469,36 @@ def julian_datetime(julianday: int, millisecond: int = 0, /) -> DateTime:
     second, millisecond = divmod(millisecond, 1000)
 
     return DateTime(year, month, day, hour, minute, second, millisecond * 1000)
+
+def jpeg_decode_colorspace(
+    photometric: int,
+    planarconfig: int,
+    extrasamples: tuple[int, ...],
+    jfif: bool,
+    /,
+) -> tuple[int | None, int | str | None]:
+    """Return JPEG and output color space for `jpeg_decode` function."""
+    colorspace: int | None = None
+    outcolorspace: int | str | None = None
+    if extrasamples:
+        pass
+    elif photometric == 6:
+        # YCBCR -> RGB
+        outcolorspace = 2  # RGB
+    elif photometric == 2:
+        # RGB -> RGB
+        if not jfif:
+            # found in Aperio SVS
+            colorspace = 2
+        outcolorspace = 2
+    elif photometric == 5:
+        # CMYK
+        outcolorspace = 4
+    elif photometric > 3:
+        outcolorspace = PHOTOMETRIC(photometric).name
+    if planarconfig != 1:
+        outcolorspace = 1  # decode separate planes to grayscale
+    return colorspace, outcolorspace
 
 def logger() -> logging.Logger:
     """Return logging.getLogger('tifffile')."""
@@ -611,6 +721,53 @@ def snipstr(
     if isinstance(string, bytes):  # type: ignore[unreachable]
         return b'\n'.join(result)
     return '\n'.join(result)
+
+def strptime(datetime_string: str, format: str | None = None, /) -> DateTime:
+    """Return datetime corresponding to date string using common formats.
+
+    Parameters:
+        datetime_string:
+            String representation of date and time.
+        format:
+            Format of `datetime_string`.
+            By default, several datetime formats commonly found in TIFF files
+            are parsed.
+
+    Raises:
+        ValueError: `datetime_string` does not match any format.
+
+    Examples:
+        >>> strptime('2022:08:01 22:23:24')
+        datetime.datetime(2022, 8, 1, 22, 23, 24)
+
+    """
+    formats = {
+        '%Y:%m:%d %H:%M:%S': 1,  # TIFF6 specification
+        '%Y%m%d %H:%M:%S.%f': 2,  # MetaSeries
+        '%Y-%m-%dT%H %M %S.%f': 3,  # Pilatus
+        '%Y-%m-%dT%H:%M:%S.%f': 4,  # ISO
+        '%Y-%m-%dT%H:%M:%S': 5,  # ISO, microsecond is 0
+        '%Y:%m:%d %H:%M:%S.%f': 6,
+        '%d/%m/%Y %H:%M:%S': 7,
+        '%d/%m/%Y %H:%M:%S.%f': 8,
+        '%m/%d/%Y %I:%M:%S %p': 9,
+        '%m/%d/%Y %I:%M:%S.%f %p': 10,
+        '%Y%m%d %H:%M:%S': 11,
+        '%Y/%m/%d %H:%M:%S': 12,
+        '%Y/%m/%d %H:%M:%S.%f': 13,
+        '%Y-%m-%dT%H:%M:%S%z': 14,
+        '%Y-%m-%dT%H:%M:%S.%f%z': 15,
+    }
+    if format is not None:
+        formats[format] = 0  # highest priority; replaces existing key if any
+    for format, _ in sorted(formats.items(), key=lambda item: item[1]):
+        try:
+            return DateTime.strptime(datetime_string, format)
+        except ValueError:
+            pass
+    raise ValueError(
+        f'time data {datetime_string!r} does not match any format'
+    )
 
 def stripnull(
     string: str | bytes,

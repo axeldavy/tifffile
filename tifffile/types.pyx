@@ -1364,27 +1364,6 @@ class _TIFF:
             (5, 64): 'D',
         }
 
-    '''
-    @cached_property
-    def PREDICTORS(self) -> Mapping[int, Callable[..., Any]]:
-        """Map :py:class:`PREDICTOR` value to encode function."""
-        return PredictorCodec(True)
-
-    @cached_property
-    def UNPREDICTORS(self) -> Mapping[int, Callable[..., Any]]:
-        """Map :py:class:`PREDICTOR` value to decode function."""
-        return PredictorCodec(False)
-
-    @cached_property
-    def COMPRESSORS(self) -> Mapping[int, Callable[..., Any]]:
-        """Map :py:class:`COMPRESSION` value to compress function."""
-        return CompressionCodec(True)
-
-    @cached_property
-    def DECOMPRESSORS(self) -> Mapping[int, Callable[..., Any]]:
-        """Map :py:class:`COMPRESSION` value to decompress function."""
-        return CompressionCodec(False)
-    '''
 
     @cached_property
     def IMAGE_COMPRESSIONS(self) -> set[int]:

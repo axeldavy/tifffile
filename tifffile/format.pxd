@@ -4,8 +4,8 @@ from libc.stdint cimport int64_t, uint64_t
 
 
 
-cdef enum class ByteOrder:
-    """TIFF byte order."""
+"""TIFF byte order."""
+cdef enum ByteOrder:
     II # Little-endian.
     MM # Big-endian.
 

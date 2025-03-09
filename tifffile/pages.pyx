@@ -1,12 +1,601 @@
 # cython: language_level=3
-# cython: boundscheck=False
-# cython: wraparound=False
+# cython: boundscheck=True
+# cython: wraparound=True
 # cython: cdivision=True
 # cython: nonecheck=False
 # distutils: language=c++
 
 from libc.stdint cimport int32_t, int64_t
-from .types cimport DATATYPE, COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR, EXTRASAMPLE
+
+from .format cimport ByteOrder
+from .tags cimport TiffTag, TiffTags
+from .tags import read_uic1tag
+from .types import COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR,\
+    EXTRASAMPLE, RESUNIT, TiffFileError, TIFF
+from .utils cimport product
+from .utils import logger, enumarg,\
+    pformat, astype, strptime, apply_colormap,\
+    create_output, stripnull, bytes2str,\
+    jpeg_decode_colorspace, identityfunc
+
+from concurrent.futures import ThreadPoolExecutor
+cimport cython
+from functools import cached_property
+import math
+import numpy
+import os
+import struct
+import warnings
+
+#from .tifffile import TiffPages, ZarrTiffStore, TiffFrame
+
+try:
+    import imagecodecs
+except ImportError:
+    # load pure Python implementation of some codecs
+    try:
+        from . import _imagecodecs as imagecodecs  # type: ignore[no-redef]
+    except ImportError:
+        import _imagecodecs as imagecodecs  # type: ignore[no-redef]
+
+@cython.final
+cdef class CompressionCodec:
+    """Map :py:class:`COMPRESSION` value to encode or decode function.
+
+    Parameters:
+        encode: If *True*, return encode functions, else decode functions.
+
+    """
+
+    cdef dict _codecs#: dict[int, Callable[..., Any]]
+    cdef bint _encode
+
+    def __init__(self, encode: bool) -> None:
+        self._codecs = {1: identityfunc}
+        self._encode = bool(encode)
+
+    def __getitem__(self, key: int, /) -> Callable[..., Any]:
+        if key in self._codecs:
+            return self._codecs[key]
+        codec: Callable[..., Any]
+        try:
+            # TODO: enable CCITTRLE decoder for future imagecodecs
+            # if key == 2:
+            #     if self._encode:
+            #         codec = imagecodecs.ccittrle_encode
+            #     else:
+            #         codec = imagecodecs.ccittrle_decode
+            if key == 5:
+                if self._encode:
+                    codec = imagecodecs.lzw_encode
+                else:
+                    codec = imagecodecs.lzw_decode
+            elif key in {6, 7, 33007}:
+                if self._encode:
+                    if key in {6, 33007}:
+                        raise NotImplementedError
+                    codec = imagecodecs.jpeg_encode
+                else:
+                    codec = imagecodecs.jpeg_decode
+            elif key in {8, 32946, 50013}:
+                if (
+                    hasattr(imagecodecs, 'DEFLATE')
+                    and imagecodecs.DEFLATE.available
+                ):
+                    # imagecodecs built with deflate
+                    if self._encode:
+                        codec = imagecodecs.deflate_encode
+                    else:
+                        codec = imagecodecs.deflate_decode
+                elif (
+                    hasattr(imagecodecs, 'ZLIB') and imagecodecs.ZLIB.available
+                ):
+                    if self._encode:
+                        codec = imagecodecs.zlib_encode
+                    else:
+                        codec = imagecodecs.zlib_decode
+                else:
+                    # imagecodecs built without zlib
+                    try:
+                        from . import _imagecodecs
+                    except ImportError:
+                        import _imagecodecs  # type: ignore[no-redef]
+
+                    if self._encode:
+                        codec = _imagecodecs.zlib_encode
+                    else:
+                        codec = _imagecodecs.zlib_decode
+            elif key == 32773:
+                if self._encode:
+                    codec = imagecodecs.packbits_encode
+                else:
+                    codec = imagecodecs.packbits_decode
+            elif key in {33003, 33004, 33005, 34712}:
+                if self._encode:
+                    codec = imagecodecs.jpeg2k_encode
+                else:
+                    codec = imagecodecs.jpeg2k_decode
+            elif key == 34887:
+                if self._encode:
+                    codec = imagecodecs.lerc_encode
+                else:
+                    codec = imagecodecs.lerc_decode
+            elif key == 34892:
+                # DNG lossy
+                if self._encode:
+                    codec = imagecodecs.jpeg8_encode
+                else:
+                    codec = imagecodecs.jpeg8_decode
+            elif key == 34925:
+                if hasattr(imagecodecs, 'LZMA') and imagecodecs.LZMA.available:
+                    if self._encode:
+                        codec = imagecodecs.lzma_encode
+                    else:
+                        codec = imagecodecs.lzma_decode
+                else:
+                    # imagecodecs built without lzma
+                    try:
+                        from . import _imagecodecs
+                    except ImportError:
+                        import _imagecodecs  # type: ignore[no-redef]
+
+                    if self._encode:
+                        codec = _imagecodecs.lzma_encode
+                    else:
+                        codec = _imagecodecs.lzma_decode
+            elif key == 34933:
+                if self._encode:
+                    codec = imagecodecs.png_encode
+                else:
+                    codec = imagecodecs.png_decode
+            elif key in {34934, 22610}:
+                if self._encode:
+                    codec = imagecodecs.jpegxr_encode
+                else:
+                    codec = imagecodecs.jpegxr_decode
+            elif key == 48124:
+                if self._encode:
+                    codec = imagecodecs.jetraw_encode
+                else:
+                    codec = imagecodecs.jetraw_decode
+            elif key in {50000, 34926}:  # 34926 deprecated
+                if self._encode:
+                    codec = imagecodecs.zstd_encode
+                else:
+                    codec = imagecodecs.zstd_decode
+            elif key in {50001, 34927}:  # 34927 deprecated
+                if self._encode:
+                    codec = imagecodecs.webp_encode
+                else:
+                    codec = imagecodecs.webp_decode
+            elif key in {65000, 65001, 65002} and not self._encode:
+                codec = imagecodecs.eer_decode
+            elif key in {50002, 52546}:
+                if self._encode:
+                    codec = imagecodecs.jpegxl_encode
+                else:
+                    codec = imagecodecs.jpegxl_decode
+            else:
+                try:
+                    msg = f'{COMPRESSION(key)!r} not supported'
+                except ValueError:
+                    msg = f'{key} is not a known COMPRESSION'
+                raise KeyError(msg)
+        except (AttributeError, ImportError) as exc:
+            raise KeyError(
+                f'{COMPRESSION(key)!r} ' "requires the 'imagecodecs' package"
+            ) from exc
+        except NotImplementedError as exc:
+            raise KeyError(f'{COMPRESSION(key)!r} not implemented') from exc
+        self._codecs[key] = codec
+        return codec
+
+    def __contains__(self, key: Any, /) -> bool:
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+    def __iter__(self) -> Iterator[int]:
+        yield 1  # dummy
+
+    def __len__(self) -> int:
+        return 1  # dummy
+
+
+@cython.final
+cdef class PredictorCodec:
+    """Map :py:class:`PREDICTOR` value to encode or decode function.
+
+    Parameters:
+        encode: If *True*, return encode functions, else decode functions.
+
+    """
+
+    cdef dict _codecs#: dict[int, Callable[..., Any]]
+    cdef bint _encode
+
+    def __init__(self, encode: bool) -> None:
+        self._codecs = {1: identityfunc}
+        self._encode = bool(encode)
+
+    def __getitem__(self, key: int, /) -> Callable[..., Any]:
+        if key in self._codecs:
+            return self._codecs[key]
+        codec: Callable[..., Any]
+        try:
+            if key == 2:
+                if self._encode:
+                    codec = imagecodecs.delta_encode
+                else:
+                    codec = imagecodecs.delta_decode
+            elif key == 3:
+                if self._encode:
+                    codec = imagecodecs.floatpred_encode
+                else:
+                    codec = imagecodecs.floatpred_decode
+            elif key == 34892:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_encode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_decode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+            elif key == 34893:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_encode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_decode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+            elif key == 34894:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_encode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_decode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+            elif key == 34895:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_encode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_decode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+            else:
+                raise KeyError(f'{key} is not a known PREDICTOR')
+        except AttributeError as exc:
+            raise KeyError(
+                f'{PREDICTOR(key)!r}' " requires the 'imagecodecs' package"
+            ) from exc
+        except NotImplementedError as exc:
+            raise KeyError(f'{PREDICTOR(key)!r} not implemented') from exc
+        self._codecs[key] = codec
+        return codec
+
+    def __contains__(self, key: Any, /) -> bool:
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+    def __iter__(self) -> Iterator[int]:
+        yield 1  # dummy
+
+    def __len__(self) -> int:
+        return 1  # dummy
+
+PREDICTORS = PredictorCodec(True)
+UNPREDICTORS = PredictorCodec(False)
+COMPRESSORS = CompressionCodec(True)
+DECOMPRESSORS = CompressionCodec(False)
+
+def imagej_metadata(
+    data: bytes, bytecounts: Sequence[int], byteorder: ByteOrder, /
+) -> dict[str, Any]:
+    """Return IJMetadata tag value.
+
+    Parameters:
+        bytes:
+            Encoded value of IJMetadata tag.
+        bytecounts:
+            Value of IJMetadataByteCounts tag.
+        byteorder:
+            Byte order of TIFF file.
+
+    Returns:
+        Metadata dict with optional items:
+
+            'Info' (str):
+                Human-readable information as string.
+                Some formats, such as OIF or ScanImage, can be parsed into
+                dicts with :py:func:`matlabstr2py` or the
+                `oiffile.SettingsFile()` function of the
+                `oiffile <https://pypi.org/project/oiffile/>`_  package.
+            'Labels' (Sequence[str]):
+                Human-readable labels for each channel.
+            'Ranges' (Sequence[float]):
+                Lower and upper values for each channel.
+            'LUTs' (list[numpy.ndarray[(3, 256), 'uint8']]):
+                Color palettes for each channel.
+            'Plot' (bytes):
+                Undocumented ImageJ internal format.
+            'ROI', 'Overlays' (bytes):
+                Undocumented ImageJ internal region of interest and overlay
+                format. Can be parsed with the
+                `roifile <https://pypi.org/project/roifile/>`_  package.
+            'Properties' (dict[str, str]):
+                Map of key, value items.
+
+    """
+
+    def _string(data: bytes, byteorder: ByteOrder, /) -> str:
+        return data.decode('utf-16' + {'>': 'be', '<': 'le'}[byteorder])
+
+    def _doubles(data: bytes, byteorder: ByteOrder, /) -> tuple[float, ...]:
+        return struct.unpack(byteorder + ('d' * (len(data) // 8)), data)
+
+    def _lut(data: bytes, byteorder: ByteOrder, /) -> NDArray[numpy.uint8]:
+        return numpy.frombuffer(data, numpy.uint8).reshape(-1, 256)
+
+    def _bytes(data: bytes, byteorder: ByteOrder, /) -> bytes:
+        return data
+
+    # big-endian
+    metadata_types: dict[
+        bytes, tuple[str, Callable[[bytes, ByteOrder], Any]]
+    ] = {
+        b'info': ('Info', _string),
+        b'labl': ('Labels', _string),
+        b'rang': ('Ranges', _doubles),
+        b'luts': ('LUTs', _lut),
+        b'plot': ('Plot', _bytes),
+        b'roi ': ('ROI', _bytes),
+        b'over': ('Overlays', _bytes),
+        b'prop': ('Properties', _string),
+    }
+    # little-endian
+    metadata_types.update({k[::-1]: v for k, v in metadata_types.items()})
+
+    if len(bytecounts) == 0:
+        raise ValueError('no ImageJ metadata')
+
+    if data[:4] not in {b'IJIJ', b'JIJI'}:
+        raise ValueError('invalid ImageJ metadata')
+
+    header_size = bytecounts[0]
+    if header_size < 12 or header_size > 804:
+        raise ValueError('invalid ImageJ metadata header size')
+
+    ntypes = (header_size - 4) // 8
+    header = struct.unpack(
+        byteorder + '4sI' * ntypes, data[4 : 4 + ntypes * 8]
+    )
+    pos = 4 + ntypes * 8
+    counter = 0
+    result = {}
+    for mtype, count in zip(header[::2], header[1::2]):
+        values = []
+        name, func = metadata_types.get(mtype, (bytes2str(mtype), _bytes))
+        for _ in range(count):
+            counter += 1
+            pos1 = pos + bytecounts[counter]
+            values.append(func(data[pos:pos1], byteorder))
+            pos = pos1
+        result[name.strip()] = values[0] if count == 1 else values
+    prop = result.get('Properties')
+    if prop and len(prop) % 2 == 0:
+        result['Properties'] = dict(
+            prop[i : i + 2] for i in range(0, len(prop), 2)
+        )
+    return result
+
+def jpeg_shape(jpeg: bytes, /) -> tuple[int, int, int, int]:
+    """Return bitdepth and shape of JPEG image."""
+    i = 0
+    while i < len(jpeg):
+        marker = struct.unpack('>H', jpeg[i : i + 2])[0]
+        i += 2
+
+        if marker == 0xFFD8:
+            # start of image
+            continue
+        if marker == 0xFFD9:
+            # end of image
+            break
+        if 0xFFD0 <= marker <= 0xFFD7:
+            # restart marker
+            continue
+        if marker == 0xFF01:
+            # private marker
+            continue
+
+        length = struct.unpack('>H', jpeg[i : i + 2])[0]
+        i += 2
+
+        if 0xFFC0 <= marker <= 0xFFC3:
+            # start of frame
+            return struct.unpack('>BHHB', jpeg[i : i + 6])
+        if marker == 0xFFDA:
+            # start of scan
+            break
+
+        # skip to next marker
+        i += length - 2
+
+    raise ValueError('no SOF marker found')
+
+def ndpi_jpeg_tile(jpeg: bytes, /) -> tuple[int, int, bytes]:
+    """Return tile shape and JPEG header from JPEG with restart markers."""
+    marker: int
+    length: int
+    factor: int
+    ncomponents: int
+    restartinterval: int = 0
+    sofoffset: int = 0
+    sosoffset: int = 0
+    i: int = 0
+    while i < len(jpeg):
+        marker = struct.unpack('>H', jpeg[i : i + 2])[0]
+        i += 2
+
+        if marker == 0xFFD8:
+            # start of image
+            continue
+        if marker == 0xFFD9:
+            # end of image
+            break
+        if 0xFFD0 <= marker <= 0xFFD7:
+            # restart marker
+            continue
+        if marker == 0xFF01:
+            # private marker
+            continue
+
+        length = struct.unpack('>H', jpeg[i : i + 2])[0]
+        i += 2
+
+        if marker == 0xFFDD:
+            # define restart interval
+            restartinterval = struct.unpack('>H', jpeg[i : i + 2])[0]
+
+        elif marker == 0xFFC0:
+            # start of frame
+            sofoffset = i + 1
+            precision, imlength, imwidth, ncomponents = struct.unpack(
+                '>BHHB', jpeg[i : i + 6]
+            )
+            i += 6
+            mcuwidth = 1
+            mcuheight = 1
+            for _ in range(ncomponents):
+                cid, factor, table = struct.unpack('>BBB', jpeg[i : i + 3])
+                i += 3
+                if factor >> 4 > mcuwidth:
+                    mcuwidth = factor >> 4
+                if factor & 0b00001111 > mcuheight:
+                    mcuheight = factor & 0b00001111
+            mcuwidth *= 8
+            mcuheight *= 8
+            i = sofoffset - 1
+
+        elif marker == 0xFFDA:
+            # start of scan
+            sosoffset = i + length - 2
+            break
+
+        # skip to next marker
+        i += length - 2
+
+    if restartinterval == 0 or sofoffset == 0 or sosoffset == 0:
+        raise ValueError('missing required JPEG markers')
+
+    # patch jpeg header for tile size
+    tilelength = mcuheight
+    tilewidth = restartinterval * mcuwidth
+    jpegheader = (
+        jpeg[:sofoffset]
+        + struct.pack('>HH', tilelength, tilewidth)
+        + jpeg[sofoffset + 4 : sosoffset]
+    )
+    return tilelength, tilewidth, jpegheader
+
+def unpack_rgb(
+    data: bytes,
+    /,
+    dtype: DTypeLike | None = None,
+    bitspersample: tuple[int, ...] | None = None,
+    rescale: bool = True,
+) -> NDArray[Any]:
+    """Return array from bytes containing packed samples.
+
+    Use to unpack RGB565 or RGB555 to RGB888 format.
+    Works on little-endian platforms only.
+
+    Parameters:
+        data:
+            Bytes to be decoded.
+            Samples in each pixel are stored consecutively.
+            Pixels are aligned to 8, 16, or 32 bit boundaries.
+        dtype:
+            Data type of samples.
+            The byte order applies also to the data stream.
+        bitspersample:
+            Number of bits for each sample in pixel.
+        rescale:
+            Upscale samples to number of bits in dtype.
+
+    Returns:
+        Flattened array of unpacked samples of native dtype.
+
+    Examples:
+        >>> data = struct.pack('BBBB', 0x21, 0x08, 0xFF, 0xFF)
+        >>> print(unpack_rgb(data, '<B', (5, 6, 5), False))
+        [ 1  1  1 31 63 31]
+        >>> print(unpack_rgb(data, '<B', (5, 6, 5)))
+        [  8   4   8 255 255 255]
+        >>> print(unpack_rgb(data, '<B', (5, 5, 5)))
+        [ 16   8   8 255 255 255]
+
+    """
+    if bitspersample is None:
+        bitspersample = (5, 6, 5)
+    if dtype is None:
+        dtype = '<B'
+    dtype = numpy.dtype(dtype)
+    bits = int(numpy.sum(bitspersample))
+    if not (
+        bits <= 32 and all(i <= dtype.itemsize * 8 for i in bitspersample)
+    ):
+        raise ValueError(f'sample size not supported: {bitspersample}')
+    dt = next(i for i in 'BHI' if numpy.dtype(i).itemsize * 8 >= bits)
+    data_array = numpy.frombuffer(data, dtype.byteorder + dt)
+    result = numpy.empty((data_array.size, len(bitspersample)), dtype.char)
+    for i, bps in enumerate(bitspersample):
+        t = data_array >> int(numpy.sum(bitspersample[i + 1 :]))
+        t &= int('0b' + '1' * bps, 2)
+        if rescale:
+            o = ((dtype.itemsize * 8) // bps + 1) * bps
+            if o > data_array.dtype.itemsize * 8:
+                t = t.astype('I')
+            t *= (2**o - 1) // (2**bps - 1)
+            t //= 2 ** (o - (dtype.itemsize * 8))
+        result[:, i] = t
+    return result.reshape(-1)
 
 cdef class TiffPage:
     """TIFF image file directory (IFD).
@@ -26,17 +615,17 @@ cdef class TiffPage:
         TiffFileError: Invalid TIFF structure.
 
     """
-    cdef TiffTags tags
+    cdef public TiffTags tags
     """Tags belonging to page."""
-    cdef TiffFile parent
+    cdef public object parent
     """TiffFile instance page belongs to."""
-    cdef int64_t offset
+    cdef public int64_t offset
     """Position of page in file."""
-    cdef tuple shape#: tuple[int, ...]
+    cdef public tuple shape#: tuple[int, ...]
     """Shape of image array in page."""
-    cdef object dtype#: numpy.dtype[Any] | None
+    cdef public object dtype#: numpy.dtype[Any] | None
     """Data type of image array in page."""
-    cdef int64_t[5] shaped
+    cdef public int64_t[5] shaped
     """Normalized 5-dimensional shape of image array in page:
 
         0. separate samplesperpixel or 1.
@@ -46,13 +635,13 @@ cdef class TiffPage:
         4. contig samplesperpixel or 1.
 
     """
-    cdef str axes
+    cdef public str axes
     """Character codes for dimensions in image array:
     'S' sample, 'X' width, 'Y' length, 'Z' depth.
     """
-    cdef tuple dataoffsets#: tuple[int, ...]
+    cdef public tuple dataoffsets#: tuple[int, ...]
     """Positions of strips or tiles in file."""
-    cdef tuple databytecounts#: tuple[int, ...]
+    cdef public tuple databytecounts#: tuple[int, ...]
     """Size of strips or tiles in file."""
     cdef object _dtype#: numpy.dtype[Any] | None
     cdef tuple _index#: tuple[int, ...]  # index of page in IFD tree
@@ -92,7 +681,7 @@ cdef class TiffPage:
     """:py:class:`PREDICTOR` applied to image data before compression."""
     cdef public tuple extrasamples # tuple[int, ...]
     """:py:class:`EXTRASAMPLE` interpretation of extra components in pixel."""
-    cdef public int64_t[2] subsampling
+    cdef public tuple subsampling # int64_t[2]
     """Subsampling factors used for chrominance components."""
     cdef public tuple subifds # tuple[int, ...]
     """Positions of SubIFDs in file."""
@@ -193,7 +782,10 @@ cdef class TiffPage:
             tagdata = data[tagindex : tagindex + tagsize]
             try:
                 tag = TiffTag.fromfile(
-                    parent, offset=tagoffset + i * tagsize_, header=tagdata
+                    parent.filehandle,
+                    parent.tiff,
+                    offset=tagoffset + i * tagsize_,
+                    header=tagdata
                 )
             except TiffFileError as exc:
                 logger().error(f'<TiffTag.fromfile> raised {exc!r:.128}')
@@ -212,7 +804,7 @@ cdef class TiffPage:
                 continue
             setattr(self, name, value)
 
-        value = tags.valueof(270, index=1)
+        value = tags.valueof(270, default=None, index=1)
         if isinstance(value, str):
             self.description1 = value
 
@@ -550,7 +1142,7 @@ cdef class TiffPage:
                 mcustarts += self.dataoffsets[0]
                 self.dataoffsets = tuple(mcustarts.tolist())
 
-    @cached_property
+    @property#@cached_property
     def decode(
         self,
     ) -> Callable[
@@ -608,7 +1200,7 @@ cdef class TiffPage:
 
             return cache(decode_raise_dtype)
 
-        if 0 in self.shaped:
+        if 0 in tuple(self.shaped):
 
             def decode_raise_empty(*args, **kwargs):
                 raise ValueError('empty image')
@@ -619,7 +1211,7 @@ cdef class TiffPage:
             if self.compression == 1:
                 decompress = None
             else:
-                decompress = TIFF.DECOMPRESSORS[self.compression]
+                decompress = DECOMPRESSORS[self.compression]
             if (
                 self.compression in {65000, 65001, 65002}
                 and not self.parent.is_eer
@@ -636,7 +1228,7 @@ cdef class TiffPage:
             if self.predictor == 1:
                 unpredict = None
             else:
-                unpredict = TIFF.UNPREDICTORS[self.predictor]
+                unpredict = UNPREDICTORS[self.predictor]
         except KeyError as exc:
             if self.compression in TIFF.IMAGE_COMPRESSIONS:
                 logger().warning(
@@ -1205,9 +1797,9 @@ cdef class TiffPage:
             for segment in fh.read_segments(
                 self.dataoffsets,
                 self.databytecounts,
-                lock=lock,
+                #lock=lock,
                 sort=sort,
-                buffersize=buffersize,
+                buffersize=-1 if buffersize is None else buffersize,
                 flat=True,
             ):
                 yield decode(segment)
@@ -1219,9 +1811,9 @@ cdef class TiffPage:
                 for segments in fh.read_segments(
                     self.dataoffsets,
                     self.databytecounts,
-                    lock=lock,
+                    #lock=lock,
                     sort=sort,
-                    buffersize=buffersize,
+                    buffersize=-1 if buffersize is None else buffersize,
                     flat=False,
                 ):
                     yield from executor.map(decode, segments)
@@ -1281,9 +1873,9 @@ cdef class TiffPage:
                 Format of image in file is not supported and cannot be decoded.
 
         """
-        keyframe = self.keyframe  # self or keyframe
+        cdef TiffPage keyframe = self.keyframe  # self or keyframe
 
-        if 0 in keyframe.shaped or keyframe._dtype is None:
+        if 0 in tuple(keyframe.shaped) or keyframe._dtype is None:
             return numpy.empty((0,), keyframe.dtype)
 
         if len(self.dataoffsets) == 0:
@@ -1335,7 +1927,7 @@ cdef class TiffPage:
                 result = imagecodecs.bitorder_decode(result, out=result)
             if keyframe.predictor != 1:
                 # predictors without compression
-                unpredict = TIFF.UNPREDICTORS[keyframe.predictor]
+                unpredict = UNPREDICTORS[keyframe.predictor]
                 if keyframe.predictor == 1:
                     result = unpredict(result, axis=-2, out=result)
                 else:
@@ -1362,7 +1954,7 @@ cdef class TiffPage:
                     fh.open()
                 fh.seek(self.tags[273].value[0])  # StripOffsets
                 data = fh.read(self.tags[279].value[0])  # StripByteCounts
-            decompress = TIFF.DECOMPRESSORS[self.compression]
+            decompress = DECOMPRESSORS[self.compression]
             result = decompress(
                 data,
                 bitspersample=self.bitspersample,
@@ -1442,6 +2034,7 @@ cdef class TiffPage:
             **kwarg: Passed to :py:class:`ZarrTiffStore`.
 
         """
+        from .tifffile import ZarrTiffStore
         return ZarrTiffStore(self, **kwargs)
 
     def asrgb(
@@ -1562,20 +2155,20 @@ cdef class TiffPage:
         """Number of dimensions in image array."""
         return len(self.shape)
 
-    @cached_property
+    @property#@cached_property
     def dims(self) -> tuple[str, ...]:
         """Names of dimensions in image array."""
         names = TIFF.AXES_NAMES
-        return tuple(names[ax] for ax in self.axes)
+        return tuple([names[str(ax)] for ax in self.axes])
 
-    @cached_property
+    @property#@cached_property
     def sizes(self) -> dict[str, int]:
         """Ordered map of dimension names to lengths."""
         shape = self.shape
         names = TIFF.AXES_NAMES
-        return {names[ax]: shape[i] for i, ax in enumerate(self.axes)}
+        return {names[str(ax)]: shape[i] for i, ax in enumerate(self.axes)}
 
-    @cached_property
+    @property#@cached_property
     def coords(self) -> dict[str, NDArray[Any]]:
         """Ordered map of dimension names to coordinate arrays."""
         resolution = self.get_resolution()
@@ -1609,18 +2202,18 @@ cdef class TiffPage:
             assert len(coords[name]) == size
         return coords
 
-    @cached_property
+    @property
     def attr(self) -> dict[str, Any]:
         """Arbitrary metadata associated with image array."""
         # TODO: what to return?
         return {}
 
-    @cached_property
+    @property
     def size(self) -> int:
         """Number of elements in image array."""
         return product(self.shape)
 
-    @cached_property
+    @property
     def nbytes(self) -> int:
         """Number of bytes in image array."""
         if self.dtype is None:
@@ -1705,7 +2298,7 @@ cdef class TiffPage:
             resolution.append(value)
         return resolution[0], resolution[1]
 
-    @cached_property
+    @property#@cached_property
     def resolution(self) -> tuple[float, float]:
         """Number of pixels per resolutionunit in X and Y directions."""
         # values are returned in (somewhat unexpected) XY order to
@@ -1739,7 +2332,7 @@ cdef class TiffPage:
             return (self.tiledepth, self.tilelength, self.tilewidth)
         return (self.tilelength, self.tilewidth)
 
-    @cached_property
+    @property#@cached_property
     def chunks(self) -> tuple[int, ...]:
         """Shape of images in tiles or strips."""
         shape: list[int] = []
@@ -1753,7 +2346,7 @@ cdef class TiffPage:
             shape.append(self.samplesperpixel)
         return tuple(shape)
 
-    @cached_property
+    @property#@cached_property
     def chunked(self) -> tuple[int, ...]:
         """Shape of chunked image."""
         shape: list[int] = []
@@ -1781,7 +2374,7 @@ cdef class TiffPage:
             shape.append(1)
         return tuple(shape)
 
-    @cached_property
+    @property#@cached_property
     def hash(self) -> int:
         """Checksum to identify pages in same series.
 
@@ -1803,7 +2396,7 @@ cdef class TiffPage:
 
         """
         return hash(
-            self.shaped
+            tuple(self.shaped)
             + (
                 self.parent.tiff,
                 self.rowsperstrip,
@@ -1820,14 +2413,15 @@ cdef class TiffPage:
             )
         )
 
-    @cached_property
+    @property#@cached_property
     def pages(self) -> TiffPages | None:
         """Sequence of sub-pages, SubIFDs."""
         if 330 not in self.tags:
             return None
+        from .tifffile import TiffPages
         return TiffPages(self, index=self.index)
 
-    @cached_property
+    @property#@cached_property
     def maxworkers(self) -> int:
         """Maximum number of threads for decoding segments.
 
@@ -1852,7 +2446,7 @@ cdef class TiffPage:
                 return min(TIFF.MAXWORKERS, len(self.dataoffsets))
         return 2  # optimum for large number of uncompressed tiles
 
-    @cached_property
+    @property#@cached_property
     def is_contiguous(self) -> bool:
         """Image data is stored contiguously.
 
@@ -1901,7 +2495,7 @@ cdef class TiffPage:
             return True
         return False
 
-    @cached_property
+    @property#@cached_property
     def is_final(self) -> bool:
         """Image data are stored in final form. Excludes byte-swapping."""
         return (
@@ -1911,7 +2505,7 @@ cdef class TiffPage:
             and not self.is_subsampled
         )
 
-    @cached_property
+    @property#@cached_property
     def is_memmappable(self) -> bool:
         """Image data in file can be memory-mapped to NumPy array."""
         return (
@@ -1933,6 +2527,7 @@ cdef class TiffPage:
     def _str(self, detail: int = 0, width: int = 79) -> str:
         """Return string containing information about TiffPage."""
         if self.keyframe != self:
+            from .tifffile import TiffFrame
             return TiffFrame._str(
                 self, detail, width  # type: ignore[arg-type]
             )
@@ -2034,7 +2629,7 @@ cdef class TiffPage:
             return None
         return names
 
-    @cached_property
+    @property#@cached_property
     def flags(self) -> set[str]:
         r"""Set of ``is\_\*`` properties that are True."""
         return {
@@ -2043,7 +2638,7 @@ cdef class TiffPage:
             if getattr(self, 'is_' + name)
         }
 
-    @cached_property
+    @property#@cached_property
     def andor_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from Andor tags."""
         if not self.is_andor:
@@ -2059,7 +2654,7 @@ cdef class TiffPage:
             # del self.tags[code]
         return result
 
-    @cached_property
+    @property#@cached_property
     def epics_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from EPICS areaDetector tags.
 
@@ -2091,7 +2686,7 @@ cdef class TiffPage:
             # del self.tags[code]
         return result
 
-    @cached_property
+    @property#@cached_property
     def ndpi_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from Hamamatsu NDPI tags."""
         # TODO: parse 65449 ini style comments
@@ -2116,7 +2711,7 @@ cdef class TiffPage:
             result['McuStarts'] = mcustarts
         return result
 
-    @cached_property
+    @property#@cached_property
     def geotiff_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from GeoTIFF tags."""
         if not self.is_geotiff:
@@ -2240,7 +2835,7 @@ cdef class TiffPage:
             }
         return result
 
-    @cached_property
+    @property#@cached_property
     def shaped_description(self) -> str | None:
         """Description containing array shape if exists, else None."""
         for description in (self.description, self.description1):
@@ -2252,7 +2847,7 @@ cdef class TiffPage:
                 return description
         return None
 
-    @cached_property
+    @property#@cached_property
     def imagej_description(self) -> str | None:
         """ImageJ description if exists, else None."""
         for description in (self.description, self.description1):
@@ -2262,7 +2857,7 @@ cdef class TiffPage:
                 return description
         return None
 
-    @cached_property
+    @property#@cached_property
     def is_jfif(self) -> bool:
         """JPEG compressed segments contain JFIF metadata."""
         if (

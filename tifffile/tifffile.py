@@ -927,6 +927,7 @@ from functools import cached_property
 
 from .format import TiffFormat
 from .files import FileHandle, FileSequence, TiffSequence
+from .pages import TiffPage
 from .tags import TiffTag, TiffTags, TiffTagRegistry
 
 import numpy
@@ -7433,7 +7434,7 @@ class TiffFormat_:
 
 
 @final
-class TiffPage:
+class TiffPage_:
     """TIFF image file directory (IFD).
 
     TiffPage instances are not thread-safe. All attributes are read-only.
@@ -7629,7 +7630,7 @@ class TiffPage:
             tagdata = data[tagindex : tagindex + tagsize]
             try:
                 tag = TiffTag.fromfile(
-                    parent._fh, parent.tiff, offset=tagoffset + i * tagsize_, header=tagdata
+                    parent.filehandle, parent.tiff, offset=tagoffset + i * tagsize_, header=tagdata
                 )
             except TiffFileError as exc:
                 logger().error(f'<TiffTag.fromfile> raised {exc!r:.128}')
@@ -10190,7 +10191,7 @@ class TiffFrame:
                     continue
                 try:
                     tag = TiffTag.fromfile(
-                        self.parent._fh,
+                        self.parent.filehandle,
                         self.parent.tiff,
                         offset=tagoffset + tagindex,
                         header=tagbytes[tagindex : tagindex + tagsize],

@@ -1,7 +1,7 @@
 #distutils: language=c++
 
 
-cpdef enum class DATATYPE:
+cpdef enum DATATYPE:
     """TIFF tag data types."""
 
     BYTE = 1

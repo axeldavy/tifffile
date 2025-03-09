@@ -1429,22 +1429,6 @@ cdef class TiffTag:
 
     """
 
-    cdef public FileHandle fh
-    """TIFF file as memory-mapped bytes."""
-    cdef public TiffFormat tiff_format
-    """TIFF format to interprete the tag belongs."""
-    cdef public int64_t offset
-    """Position of tag structure in file."""
-    cdef public int64_t code
-    """Decimal code of tag."""
-    cdef public int64_t datatype
-    """:py:class:`DATATYPE` of tag value item."""
-    cdef public int64_t count
-    """Number of items in tag value."""
-    cdef public int64_t valueoffset
-    """Position of tag value in file."""
-    cdef object _value
-
     def __init__(
         self,
         FileHandle fh,
@@ -2077,14 +2061,11 @@ cdef class TiffTags:
 
     """
 
-    cdef dict _dict#: dict[int, TiffTag]
-    cdef list _list#: list[dict[int, TiffTag]]
-
     def __cinit__(self):
         self._dict = {}
         self._list = [self._dict]
 
-    cpdef void add(self, tag: TiffTag):
+    cpdef void add(self, TiffTag tag):
         """Add tag."""
         cdef int64_t code = tag.code
         cdef dict d
@@ -2397,9 +2378,6 @@ cdef class TiffTagRegistry:
         4
 
     """
-
-    cdef dict _dict#: dict[int | str, str | int]
-    cdef list _list#: list[dict[int | str, str | int]]
 
     def __init__(self, object arg):
         self._dict = {}
