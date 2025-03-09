@@ -1134,11 +1134,7 @@ cdef object read_tag(int32_t tag,
         return read_nih_image_header(fh, byteorder, dtype, count, offsetsize)
             # 40001: read_bytes,
     elif tag == 51123:
-        try:
-            return json.loads(stripnull(fh.read(count)).decode())
-        except ValueError as exc:
-            logger().warning(f'<tifffile.read_json> raised {exc!r:.128}')
-        return None
+        return read_json(fh, byteorder, dtype, count, offsetsize)
     elif tag == 33471:
         return read_sis_ini(fh, byteorder, dtype, count, offsetsize)
     elif tag == 33560:

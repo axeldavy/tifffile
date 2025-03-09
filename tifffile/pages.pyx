@@ -6,7 +6,8 @@
 #cython: profile=True
 #distutils: language=c++
 
-from libc.stdint cimport int32_t, int64_t
+from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdlib cimport malloc, free
 
 from .format cimport ByteOrder
 from .tags cimport TiffTag, TiffTags
@@ -28,7 +29,6 @@ import os
 import struct
 import warnings
 
-#from .tifffile import TiffPages, ZarrTiffStore, TiffFrame
 
 try:
     import imagecodecs
@@ -55,7 +55,7 @@ cdef class CompressionCodec:
         self._codecs = {1: identityfunc}
         self._encode = bool(encode)
 
-    def __getitem__(self, key_obj, /) -> Callable[..., Any]:
+    def __getitem__(self, key_obj) -> Callable[..., Any]:
         if key_obj in self._codecs:
             return self._codecs[key_obj]
         cdef int64_t key = key_obj
@@ -192,7 +192,7 @@ cdef class CompressionCodec:
         self._codecs[key] = codec
         return codec
 
-    def __contains__(self, key: Any, /) -> bool:
+    def __contains__(self, key: Any) -> bool:
         try:
             self[key]
         except KeyError:
@@ -222,7 +222,7 @@ cdef class PredictorCodec:
         self._codecs = {1: identityfunc}
         self._encode = bool(encode)
 
-    def __getitem__(self, key: int, /) -> Callable[..., Any]:
+    def __getitem__(self, key: int) -> Callable[..., Any]:
         if key in self._codecs:
             return self._codecs[key]
         codec: Callable[..., Any]
@@ -308,7 +308,7 @@ cdef class PredictorCodec:
         self._codecs[key] = codec
         return codec
 
-    def __contains__(self, key: Any, /) -> bool:
+    def __contains__(self, key: Any) -> bool:
         try:
             self[key]
         except KeyError:
@@ -327,7 +327,7 @@ COMPRESSORS = CompressionCodec(True)
 DECOMPRESSORS = CompressionCodec(False)
 
 def imagej_metadata(
-    data: bytes, bytecounts: Sequence[int], byteorder: ByteOrder, /
+    data: bytes, bytecounts: Sequence[int], byteorder_str
 ) -> dict[str, Any]:
     """Return IJMetadata tag value.
 
@@ -336,7 +336,7 @@ def imagej_metadata(
             Encoded value of IJMetadata tag.
         bytecounts:
             Value of IJMetadataByteCounts tag.
-        byteorder:
+        byteorder_str:
             Byte order of TIFF file.
 
     Returns:
@@ -365,21 +365,22 @@ def imagej_metadata(
 
     """
 
-    def _string(data: bytes, byteorder: ByteOrder, /) -> str:
-        return data.decode('utf-16' + {'>': 'be', '<': 'le'}[byteorder])
+    def _string(data: bytes, byteorder_str) -> str:
+        return data.decode('utf-16' + {'>': 'be', '<': 'le'}[byteorder_str])
 
-    def _doubles(data: bytes, byteorder: ByteOrder, /) -> tuple[float, ...]:
-        return struct.unpack(byteorder + ('d' * (len(data) // 8)), data)
+    def _doubles(data: bytes, byteorder_str) -> tuple[float, ...]:
+        cdef int64_t count = len(data) // 8
+        return struct.unpack(byteorder_str + ('d' * count), data)
 
-    def _lut(data: bytes, byteorder: ByteOrder, /) -> NDArray[numpy.uint8]:
+    def _lut(data: bytes, byteorder_str) -> NDArray[cnp.uint8_t]:
         return numpy.frombuffer(data, numpy.uint8).reshape(-1, 256)
 
-    def _bytes(data: bytes, byteorder: ByteOrder, /) -> bytes:
+    def _bytes(data: bytes, byteorder_str) -> bytes:
         return data
 
     # big-endian
     metadata_types: dict[
-        bytes, tuple[str, Callable[[bytes, ByteOrder], Any]]
+        bytes, tuple[str, Callable[[bytes, byteorder_str], Any]]
     ] = {
         b'info': ('Info', _string),
         b'labl': ('Labels', _string),
@@ -405,18 +406,20 @@ def imagej_metadata(
 
     ntypes = (header_size - 4) // 8
     header = struct.unpack(
-        byteorder + '4sI' * ntypes, data[4 : 4 + ntypes * 8]
+        byteorder_str + '4sI' * ntypes, data[4 : 4 + ntypes * 8]
     )
     pos = 4 + ntypes * 8
     counter = 0
     result = {}
-    for mtype, count in zip(header[::2], header[1::2]):
+    for i in range(0, len(header), 2):
+        mtype = header[i]
+        count = header[i+1]
         values = []
         name, func = metadata_types.get(mtype, (bytes2str(mtype), _bytes))
         for _ in range(count):
             counter += 1
             pos1 = pos + bytecounts[counter]
-            values.append(func(data[pos:pos1], byteorder))
+            values.append(func(data[pos:pos1], byteorder_str))
             pos = pos1
         result[name.strip()] = values[0] if count == 1 else values
     prop = result.get('Properties')
@@ -426,9 +429,11 @@ def imagej_metadata(
         )
     return result
 
-def jpeg_shape(jpeg: bytes, /) -> tuple[int, int, int, int]:
+def jpeg_shape(jpeg: bytes) -> tuple[int, int, int, int]:
     """Return bitdepth and shape of JPEG image."""
-    i = 0
+    cdef int64_t i = 0
+    cdef int64_t marker, length
+    
     while i < len(jpeg):
         marker = struct.unpack('>H', jpeg[i : i + 2])[0]
         i += 2
@@ -461,16 +466,14 @@ def jpeg_shape(jpeg: bytes, /) -> tuple[int, int, int, int]:
 
     raise ValueError('no SOF marker found')
 
-def ndpi_jpeg_tile(jpeg: bytes, /) -> tuple[int, int, bytes]:
+def ndpi_jpeg_tile(jpeg: bytes) -> tuple[int, int, bytes]:
     """Return tile shape and JPEG header from JPEG with restart markers."""
-    marker: int
-    length: int
-    factor: int
-    ncomponents: int
-    restartinterval: int = 0
-    sofoffset: int = 0
-    sosoffset: int = 0
-    i: int = 0
+    cdef int64_t marker, length, factor, ncomponents, restartinterval = 0
+    cdef int64_t sofoffset = 0, sosoffset = 0
+    cdef int64_t mcuwidth = 1, mcuheight = 1, tilelength, tilewidth
+    cdef int64_t cid, table
+    cdef int64_t i = 0
+    
     while i < len(jpeg):
         marker = struct.unpack('>H', jpeg[i : i + 2])[0]
         i += 2
@@ -573,6 +576,11 @@ def unpack_rgb(
         [ 16   8   8 255 255 255]
 
     """
+    cdef int64_t bits, i, bps
+    cdef int64_t o
+    cdef str dt
+    cdef object data_array, result, t
+    
     if bitspersample is None:
         bitspersample = (5, 6, 5)
     if dtype is None:
@@ -939,7 +947,7 @@ cdef class TiffPage:
                 tag.value = imagej_metadata(
                     tag.value,
                     tags[50838].value,  # IJMetadataByteCounts
-                    tiff.byteorder,
+                    tiff.byteorder_str,
                 )
             except Exception as exc:
                 logger().warning(
@@ -1183,10 +1191,13 @@ cdef class TiffPage:
                 Invalid TIFF structure.
 
         """
+        cdef int64_t stdepth, stlength, stwidth, samples, imdepth, imlength, imwidth
+        cdef int64_t width, length, depth, size
+        
         if self.hash in self.parent._parent._decoders:
             return self.parent._parent._decoders[self.hash]
 
-        def cache(decode, /):
+        def cache(decode):
             self.parent._parent._decoders[self.hash] = decode
             return decode
 
@@ -1301,7 +1312,7 @@ cdef class TiffPage:
             depth = (imdepth + stdepth - 1) // stdepth
 
             def indices(
-                segmentindex: int, /
+                segmentindex: int
             ) -> tuple[
                 tuple[int, int, int, int, int], tuple[int, int, int, int]
             ]:
@@ -1322,8 +1333,8 @@ cdef class TiffPage:
                 indices: tuple[int, int, int, int, int],
                 shape: tuple[int, int, int, int]
             ) -> NDArray[Any]:
+                cdef int64_t size = shape[0] * shape[1] * shape[2] * shape[3]
                 # return reshaped tile or raise TiffFileError
-                size = shape[0] * shape[1] * shape[2] * shape[3]
                 if data.ndim == 1 and data.size > size:
                     # decompression / unpacking might return too many bytes
                     data = data[:size]
@@ -1363,7 +1374,7 @@ cdef class TiffPage:
                 )
 
             def pad(
-                data: NDArray[Any], shape: tuple[int, int, int, int], /
+                data: NDArray[Any], shape: tuple[int, int, int, int]
             ) -> tuple[NDArray[Any], tuple[int, int, int, int]]:
                 # pad tile to shape
                 if data.shape == shape:
@@ -1373,7 +1384,7 @@ cdef class TiffPage:
                 return data, shape
 
             def pad_none(
-                shape: tuple[int, int, int, int], /
+                shape: tuple[int, int, int, int]
             ) -> tuple[int, int, int, int]:
                 # return shape of tile
                 return shape
@@ -1383,7 +1394,7 @@ cdef class TiffPage:
             length = (imlength + stlength - 1) // stlength
 
             def indices(
-                segmentindex: int, /
+                segmentindex: int
             ) -> tuple[
                 tuple[int, int, int, int, int], tuple[int, int, int, int]
             ]:
@@ -1409,7 +1420,7 @@ cdef class TiffPage:
                 shape: tuple[int, int, int, int]
             ) -> NDArray[Any]:
                 # return reshaped strip or raise TiffFileError
-                size = shape[0] * shape[1] * shape[2] * shape[3]
+                cdef int64_t size = shape[0] * shape[1] * shape[2] * shape[3]
                 if data.ndim == 1 and data.size > size:
                     # decompression / unpacking might return too many bytes
                     data = data[:size]
@@ -1437,7 +1448,7 @@ cdef class TiffPage:
                 )
 
             def pad(
-                data: NDArray[Any], shape: tuple[int, int, int, int], /
+                data: NDArray[Any], shape: tuple[int, int, int, int]
             ) -> tuple[NDArray[Any], tuple[int, int, int, int]]:
                 # pad strip length to rowsperstrip
                 shape = (shape[0], stlength, shape[2], shape[3])
@@ -1453,7 +1464,7 @@ cdef class TiffPage:
                 return data, shape
 
             def pad_none(
-                shape: tuple[int, int, int, int], /
+                shape: tuple[int, int, int, int]
             ) -> tuple[int, int, int, int]:
                 # return shape of strip
                 return (shape[0], stlength, shape[2], shape[3])
@@ -1641,7 +1652,7 @@ cdef class TiffPage:
                 f'{self.parent.byteorder}f{dtype.itemsize // 2}'
             )
 
-            def unpack(data: bytes, /) -> NDArray[Any]:
+            def unpack(data: bytes) -> NDArray[Any]:
                 # return complex integer as numpy.complex
                 return numpy.frombuffer(data, itype).astype(ftype).view(dtype)
 
@@ -1655,7 +1666,7 @@ cdef class TiffPage:
                 # raw byte order
                 dtype = numpy.dtype(self._dtype.char)
 
-            def unpack(data: bytes, /) -> NDArray[Any]:
+            def unpack(data: bytes) -> NDArray[Any]:
                 # return numpy array from buffer
                 try:
                     # read only numpy array
@@ -1668,7 +1679,7 @@ cdef class TiffPage:
 
         elif isinstance(self.bitspersample, tuple):
             # for example, RGB 565
-            def unpack(data: bytes, /) -> NDArray[Any]:
+            def unpack(data: bytes) -> NDArray[Any]:
                 # return numpy array from packed integers
                 return unpack_rgb(data, dtype, self.bitspersample)
 
@@ -1678,7 +1689,7 @@ cdef class TiffPage:
                 # floatpred_decode requires numpy.float24, which does not exist
                 raise NotImplementedError('unpredicting float24 not supported')
 
-            def unpack(data: bytes, /) -> NDArray[Any]:
+            def unpack(data: bytes) -> NDArray[Any]:
                 # return numpy.float32 array from float24
                 return imagecodecs.float24_decode(
                     data, byteorder=self.parent.byteorder
@@ -1686,7 +1697,7 @@ cdef class TiffPage:
 
         else:
             # bilevel and packed integers
-            def unpack(data: bytes, /) -> NDArray[Any]:
+            def unpack(data: bytes) -> NDArray[Any]:
                 # return NumPy array from packed integers
                 return imagecodecs.packints_decode(
                     data, dtype, self.bitspersample, runlen=stwidth * samples
@@ -1770,7 +1781,9 @@ cdef class TiffPage:
               The shape of strips depends on their linear index.
 
         """
-        keyframe = self.keyframe  # self or keyframe
+        cdef TiffPage keyframe = self.keyframe  # self or keyframe
+        cdef dict decodeargs
+        
         fh = self.parent.filehandle
         if lock is None:
             lock = fh.lock
@@ -1875,7 +1888,9 @@ cdef class TiffPage:
 
         """
         cdef TiffPage keyframe = self.keyframe  # self or keyframe
-
+        cdef object result
+        cdef bint closed
+        
         if 0 in tuple(keyframe.shaped) or keyframe._dtype is None:
             return numpy.empty((0,), keyframe.dtype)
 
