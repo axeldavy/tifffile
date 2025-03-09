@@ -37,7 +37,7 @@ cdef void lock_gil_friendly_block(unique_lock[recursive_mutex] &m) noexcept:
         locked = m.try_lock()
 
 def apply_colormap(
-    image: NDArray[Any], colormap: NDArray[Any], /, contig: bool = True
+    image: NDArray[Any], colormap: NDArray[Any], contig: bool = True
 ) -> NDArray[Any]:
     """Return palette-colored image.
 
@@ -101,7 +101,7 @@ def asbool(
         return False
     raise TypeError
 
-def astype(value: Any, /, types: Sequence[Any] | None = None) -> Any:
+def astype(value: Any, types: Sequence[Any] | None = None) -> Any:
     """Return argument as one of types if possible.
 
     >>> astype('42')
@@ -124,7 +124,7 @@ def astype(value: Any, /, types: Sequence[Any] | None = None) -> Any:
     return value
 
 def bytes2str(
-    b: bytes, /, encoding: str | None = None, errors: str = 'strict'
+    b: bytes, encoding: str | None = None, errors: str = 'strict'
 ) -> str:
     """Return Unicode string from encoded bytes."""
     if encoding is not None:
@@ -135,12 +135,12 @@ def bytes2str(
         return b.decode('cp1252', errors)
 
 
-def bytestr(s: str | bytes, /, encoding: str = 'cp1252') -> bytes:
+def bytestr(s: str | bytes, encoding: str = 'cp1252') -> bytes:
     """Return bytes from Unicode string, else pass through."""
     return s.encode(encoding) if isinstance(s, str) else s
 
 
-def clean_whitespace(string: str, /, compact: bool = False) -> str:
+def clean_whitespace(string: str, compact: bool = False) -> str:
     r"""Return string with compressed whitespace.
 
     >>> clean_whitespace('  a  \n\n  b ')
@@ -394,7 +394,7 @@ def hexdump(
             result.append(r)
     return b'\n'.join(result).decode('ascii')
 
-def identityfunc(arg: Any, /, *args: Any, **kwargs: Any) -> Any:
+def identityfunc(arg: Any, *args: Any, **kwargs: Any) -> Any:
     """Single argument identity function.
 
     >>> identityfunc('arg')

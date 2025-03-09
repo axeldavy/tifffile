@@ -1,9 +1,10 @@
-# cython: language_level=3
-# cython: boundscheck=True
-# cython: wraparound=True
-# cython: cdivision=True
-# cython: nonecheck=False
-# distutils: language=c++
+#cython: language_level=3
+#cython: boundscheck=True
+#cython: wraparound=True
+#cython: cdivision=True
+#cython: nonecheck=False
+#cython: profile=True
+#distutils: language=c++
 
 from libc.stdint cimport int32_t, int64_t
 
@@ -54,9 +55,10 @@ cdef class CompressionCodec:
         self._codecs = {1: identityfunc}
         self._encode = bool(encode)
 
-    def __getitem__(self, key: int, /) -> Callable[..., Any]:
-        if key in self._codecs:
-            return self._codecs[key]
+    def __getitem__(self, key_obj, /) -> Callable[..., Any]:
+        if key_obj in self._codecs:
+            return self._codecs[key_obj]
+        cdef int64_t key = key_obj
         codec: Callable[..., Any]
         try:
             # TODO: enable CCITTRLE decoder for future imagecodecs
@@ -536,7 +538,6 @@ def ndpi_jpeg_tile(jpeg: bytes, /) -> tuple[int, int, bytes]:
 
 def unpack_rgb(
     data: bytes,
-    /,
     dtype: DTypeLike | None = None,
     bitspersample: tuple[int, ...] | None = None,
     rescale: bool = True,

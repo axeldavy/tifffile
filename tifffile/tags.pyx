@@ -166,44 +166,15 @@ cdef str get_numpy_dtype_single(ByteOrder byteorder,
             return '>Q'
     raise ValueError(f'Unknown tag type {datatype}')
 
-'''
-cdef object read_numpy(bytes source,
-                       int64_t offset,
-                       ByteOrder byteorder,
-                       int64_t dtype,
-                       int64_t count,
-                       int64_t offsetsize):
-    """Read NumPy array tag value from file."""
-    numpy_dtype = get_numpy_dtype_single(byteorder, dtype)
-
-    cdef int nbytes = count * numpy_dtype.itemsize
-
-    result = numpy.frombuffer(source[offset:offset+nbytes], dtype=numpy_dtype)
-
-    if result.nbytes != nbytes:
-        raise ValueError('size mismatch')
-
-    if not result.dtype.isnative:
-        if not numpy_dtype.isnative:
-            result.byteswap(True)
-        result = result.view(result.dtype.newbyteorder())
-    elif result.dtype.isnative != numpy_dtype.isnative:
-        result.byteswap(True)
-
-    return result
-'''
-
-
-def read_exif_ifd(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_exif_ifd(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read EXIF tags from file."""
-    exif = read_tags(fh, byteorder, offsetsize, TIFF.EXIF_TAGS, maxifds=1)[0]
+    exif = read_tags(fh, byteorder, offsetsize, TIFF.EXIF_TAGS, 1)[0]
     for name in ('ExifVersion', 'FlashpixVersion'):
         try:
             exif[name] = bytes2str(exif[name])
@@ -220,18 +191,13 @@ def read_exif_ifd(
             pass
     return exif
 
-def read_tags(
-    fh: FileHandle,
-    /,
-    byteorder: ByteOrder,
-    offsetsize: int,
-    tagnames: TiffTagRegistry,
-    *,
-    maxifds: int | None = None,
-    customtags: (
-        dict[int, Callable[[FileHandle, ByteOrder, int, int, int], Any]] | None
-    ) = None,
-) -> list[dict[str, Any]]:
+cdef list read_tags(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t offsetsize,
+    TiffTagRegistry tagnames,
+    int64_t maxifds
+):
     """Read tag values from chain of IFDs.
 
     Parameters:
@@ -261,25 +227,27 @@ def read_tags(
 
     """
     code: int
-    dtype: int
-    count: int
+    cdef int64_t datatype
+    cdef int64_t count
     valuebytes: bytes
     valueoffset: int
+    customtags = None
 
+    cdef str byteorder_str = '>' if byteorder == ByteOrder.MM else '<'
     if offsetsize == 4:
-        offsetformat = byteorder + 'I'
+        offsetformat = byteorder_str + 'I'
         tagnosize = 2
-        tagnoformat = byteorder + 'H'
+        tagnoformat = byteorder_str + 'H'
         tagsize = 12
-        tagformat1 = byteorder + 'HH'
-        tagformat2 = byteorder + 'I4s'
+        tagformat1 = byteorder_str + 'HH'
+        tagformat2 = byteorder_str + 'I4s'
     elif offsetsize == 8:
-        offsetformat = byteorder + 'Q'
+        offsetformat = byteorder_str + 'Q'
         tagnosize = 8
-        tagnoformat = byteorder + 'Q'
+        tagnoformat = byteorder_str + 'Q'
         tagsize = 20
-        tagformat1 = byteorder + 'HH'
-        tagformat2 = byteorder + 'Q8s'
+        tagformat1 = byteorder_str + 'HH'
+        tagformat2 = byteorder_str + 'Q8s'
     else:
         raise ValueError('invalid offset size')
 
@@ -310,16 +278,16 @@ def read_tags(
         index = 0
 
         for _ in range(tagno):
-            code, dtype = unpack(tagformat1, data[index : index + 4])
+            code, datatype = unpack(tagformat1, data[index : index + 4])
             count, valuebytes = unpack(
                 tagformat2, data[index + 4 : index + tagsize]
             )
             index += tagsize
             name = tagnames.get(code, str(code))
             try:
-                valueformat = TIFF.DATA_FORMATS[dtype]
+                valueformat = TIFF.DATA_FORMATS[datatype]
             except KeyError:
-                logger().error(f'invalid data type {dtype!r} for tag #{code}')
+                logger().error(f'invalid data type {datatype!r} for tag #{code}')
                 continue
 
             valuesize = count * struct.calcsize(valueformat)
@@ -333,9 +301,8 @@ def read_tags(
                 fh.seek(valueoffset)
                 if code in customtags:
                     readfunc = customtags[code]
-                    value = readfunc(fh, byteorder, dtype, count, offsetsize)
-                elif dtype in {1, 2, 7}:
-                    # BYTES, ASCII, UNDEFINED
+                    value = readfunc(fh, byteorder, datatype, count, offsetsize)
+                elif datatype in {DATATYPE.BYTE, DATATYPE.ASCII, DATATYPE.UNDEFINED}:
                     value = fh.read(valuesize)
                     if len(value) != valuesize:
                         logger().warning(
@@ -350,9 +317,8 @@ def read_tags(
                     )
                     value = unpack(fmt, fh.read(valuesize))
                 else:
-                    value = read_numpy(fh, byteorder, dtype, count, offsetsize)
-            elif dtype in {1, 2, 7}:
-                # BYTES, ASCII, UNDEFINED
+                    value = read_numpy(fh, byteorder, datatype, count, offsetsize)
+            elif datatype in {DATATYPE.BYTE, DATATYPE.ASCII, DATATYPE.UNDEFINED}:
                 value = valuebytes[:valuesize]
             else:
                 fmt = (
@@ -365,9 +331,9 @@ def read_tags(
             process = (
                 code not in customtags
                 and code not in TIFF.TAG_TUPLE
-                and dtype != 7  # UNDEFINED
+                and datatype != DATATYPE.UNDEFINED
             )
-            if process and dtype == 2:
+            if process and datatype == DATATYPE.ASCII:
                 # TIFF ASCII fields can contain multiple strings,
                 #   each terminated with a NUL
                 try:
@@ -407,42 +373,37 @@ def read_tags(
 
     return result
 
-def read_gps_ifd(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_gps_ifd(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read GPS tags from file."""
-    return read_tags(fh, byteorder, offsetsize, TIFF.GPS_TAGS, maxifds=1)[0]
+    return read_tags(fh, byteorder, offsetsize, TIFF.GPS_TAGS, 1)[0]
 
 
-def read_interoperability_ifd(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_interoperability_ifd(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read Interoperability tags from file."""
-    return read_tags(fh, byteorder, offsetsize, TIFF.IOP_TAGS, maxifds=1)[0]
+    return read_tags(fh, byteorder, offsetsize, TIFF.IOP_TAGS, 1)[0]
 
 
-def read_bytes(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> bytes:
+cdef bytes read_bytes(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read tag data from file."""
-    count *= numpy.dtype(
-        'B' if dtype == 2 else byteorder + TIFF.DATA_FORMATS[dtype][-1]
-    ).itemsize
+    count *= get_data_format_size(datatype)
     data = fh.read(count)
     if len(data) != count:
         logger().warning(
@@ -452,55 +413,51 @@ def read_bytes(
     return data
 
 
-def read_utf8(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> str:
+cdef str read_utf8(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read unicode tag value from file."""
     return fh.read(count).decode()
 
 
-def read_numpy(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> NDArray[Any]:
+cdef object read_numpy(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read NumPy array tag value from file."""
     return fh.read_array(
-        'b' if dtype == 2 else byteorder + TIFF.DATA_FORMATS[dtype][-1], count
+        get_numpy_dtype_single(byteorder, datatype), count
     )
 
 
-def read_colormap(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> NDArray[Any]:
+cdef object read_colormap(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read ColorMap or TransferFunction tag value from file."""
-    cmap = fh.read_array(byteorder + TIFF.DATA_FORMATS[dtype][-1], count)
+    cmap = fh.read_array(get_numpy_dtype_single(byteorder, datatype), count)
     if count % 3 == 0:
         cmap.shape = (3, -1)
     return cmap
 
 
-def read_json(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> Any:
+cdef object read_json(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read JSON tag value from file."""
     data = fh.read(count)
     try:
@@ -510,14 +467,13 @@ def read_json(
     return None
 
 
-def read_mm_header(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_mm_header(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read FluoView mm_header tag value from file."""
     meta = recarray2dict(
         fh.read_record(numpy.dtype(TIFF.MM_HEADER), shape=1, byteorder=byteorder)
@@ -537,36 +493,35 @@ def read_mm_header(
     return meta
 
 
-def read_mm_stamp(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> NDArray[Any]:
+cdef object read_mm_stamp(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read FluoView mm_stamp tag value from file."""
-    return fh.read_array(byteorder + 'f8', 8)
+    cdef str byteorder_str = '>' if byteorder == ByteOrder.MM else '<'
+    return fh.read_array(byteorder_str + 'f8', 8)
 
 
-def read_uic1tag(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-    planecount: int = 0,
-) -> dict[str, Any]:
+cpdef dict read_uic1tag(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+    int64_t planecount = 0,
+):
     """Read MetaMorph STK UIC1Tag value from file.
 
     Return empty dictionary if planecount is unknown.
 
     """
-    if dtype not in {4, 5} or byteorder != '<':
-        raise ValueError(f'invalid UIC1Tag {byteorder}{dtype}')
+    if datatype not in {4, 5} or byteorder != ByteOrder.II:
+        raise ValueError(f'invalid UIC1Tag {byteorder}{datatype}')
     result = {}
-    if dtype == 5:
+    if datatype == 5:
         # pre MetaMorph 2.5 (not tested)
         values = fh.read_array('<u4', 2 * count).reshape(count, 2)
         result = {'ZDistance': values[:, 0] / values[:, 1]}
@@ -588,16 +543,15 @@ def read_uic1tag(
     return result
 
 
-def read_uic2tag(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, NDArray[Any]]:
+cdef dict read_uic2tag(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read MetaMorph STK UIC2Tag value from file."""
-    if dtype != 5 or byteorder != '<':
+    if datatype != 5 or byteorder != ByteOrder.II:
         raise ValueError('invalid UIC2Tag')
     values = fh.read_array('<u4', 6 * count).reshape(count, 6)
     return {
@@ -609,31 +563,29 @@ def read_uic2tag(
     }
 
 
-def read_uic3tag(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, NDArray[Any]]:
+cdef dict read_uic3tag(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize
+):
     """Read MetaMorph STK UIC3Tag value from file."""
-    if dtype != 5 or byteorder != '<':
+    if datatype != 5 or byteorder != ByteOrder.II:
         raise ValueError('invalid UIC3Tag')
     values = fh.read_array('<u4', 2 * count).reshape(count, 2)
     return {'Wavelengths': values[:, 0] / values[:, 1]}
 
 
-def read_uic4tag(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, NDArray[Any]]:
+cdef dict read_uic4tag(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize
+):
     """Read MetaMorph STK UIC4Tag value from file."""
-    if dtype != 4 or byteorder != '<':
+    if datatype != 4 or byteorder != ByteOrder.II:
         raise ValueError('invalid UIC4Tag')
     result = {}
     while True:
@@ -645,9 +597,12 @@ def read_uic4tag(
     return result
 
 
-def read_uic_tag(
-    fh: FileHandle, tagid: int, planecount: int, offset: bool, /
-) -> tuple[str, Any]:
+cdef tuple read_uic_tag(
+    FileHandle fh,
+    int64_t tagid,
+    int64_t planecount,
+    bint offset
+):
     """Read single UIC tag value from file and return tag name and value.
 
     UIC1Tags use an offset.
@@ -662,7 +617,7 @@ def read_uic_tag(
         return int(value[0]), (value[1])
 
     try:
-        name, dtype = TIFF.UIC_TAGS[tagid]
+        name, datatype = TIFF.UIC_TAGS[tagid]
     except IndexError:
         # unknown tag
         return f'_TagId{tagid}', read_int()
@@ -671,11 +626,11 @@ def read_uic_tag(
 
     if offset:
         pos = fh.tell()
-        if dtype not in {int, None}:
+        if datatype not in {int, None}:
             off = read_int()
             if off < 8:
                 # undocumented cases, or invalid offset
-                if dtype is str:
+                if datatype is str:
                     return name, ''
                 if tagid == 41:  # AbsoluteZValid
                     return name, off
@@ -688,18 +643,18 @@ def read_uic_tag(
 
     value: Any
 
-    if dtype is None:
+    if datatype is None:
         # skip
         name = '_' + name
         value = read_int()
-    elif dtype is int:
+    elif datatype is int:
         # int
         value = read_int()
-    elif dtype is Fraction:
+    elif datatype is Fraction:
         # fraction
         value = read_int2()
         value = value[0] / value[1]
-    elif dtype is julian_datetime:
+    elif datatype is julian_datetime:
         # datetime
         value = read_int2()
         try:
@@ -709,10 +664,10 @@ def read_uic_tag(
             logger().warning(
                 f'<tifffile.read_uic_tag> reading {name} raised {exc!r:.128}'
             )
-    elif dtype is read_uic_property:
+    elif datatype is read_uic_property:
         # ImagePropertyEx
         value = read_uic_property(fh)
-    elif dtype is str:
+    elif datatype is str:
         # pascal string
         size = read_int()
         if 0 <= size < 2**10:
@@ -727,7 +682,7 @@ def read_uic_tag(
             raise ValueError(f'invalid string size {size}')
     elif planecount == 0:
         value = None
-    elif dtype == '%ip':
+    elif datatype == '%ip':
         # sequence of pascal strings
         value = []
         for _ in range(planecount):
@@ -744,18 +699,18 @@ def read_uic_tag(
                 raise ValueError(f'invalid string size: {size}')
     else:
         # struct or numpy type
-        dtype = '<' + dtype
-        if '%i' in dtype:
-            dtype = dtype % planecount
-        if '(' in dtype:
+        datatype = '<' + datatype
+        if '%i' in datatype:
+            datatype = datatype % planecount
+        if '(' in datatype:
             # numpy type
-            value = fh.read_array(dtype, 1)[0]
+            value = fh.read_array(datatype, 1)[0]
             if value.shape[-1] == 2:
                 # assume fractions
                 value = value[..., 0] / value[..., 1]
         else:
             # struct format
-            value = struct.unpack(dtype, fh.read(struct.calcsize(dtype)))
+            value = struct.unpack(datatype, fh.read(struct.calcsize(datatype)))
             if len(value) == 1:
                 value = value[0]
 
@@ -765,7 +720,7 @@ def read_uic_tag(
     return name, value
 
 
-def read_uic_property(fh: FileHandle, /) -> dict[str, Any]:
+cdef dict read_uic_property(FileHandle fh):
     """Read UIC ImagePropertyEx or PlaneProperty tag from file."""
     size = struct.unpack('B', fh.read(1))[0]
     name = bytes2str(struct.unpack(f'{size}s', fh.read(size))[0])
@@ -781,16 +736,15 @@ def read_uic_property(fh: FileHandle, /) -> dict[str, Any]:
     return {'name': name, 'flags': flags, 'value': value}
 
 
-def read_cz_lsminfo(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_cz_lsminfo(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read CZ_LSMINFO tag value from file."""
-    if byteorder != '<':
+    if byteorder != ByteOrder.II:
         raise ValueError('invalid CZ_LSMINFO structure')
     magic_number, structure_size = struct.unpack('<II', fh.read(8))
     if magic_number not in {50350412, 67127628}:
@@ -828,14 +782,13 @@ def read_cz_lsminfo(
             pass
     return result
 
-def read_sis(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_sis(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read OlympusSIS structure from file.
 
     No specification is available. Only few fields are known.
@@ -886,21 +839,21 @@ def read_sis(
 
     return result
 
-def olympusini_metadata(inistr: str, /) -> dict[str, Any]:
+cdef tuple _keyindex(str key):
+        # split key into name and index
+        cdef int64_t index = 0
+        cdef int64_t i = len(key.rstrip('0123456789'))
+        if i < len(key):
+            index = int(key[i:]) - 1
+            key = key[:i]
+        return key, index
+
+cdef dict olympusini_metadata(str inistr):
     """Return OlympusSIS metadata from INI string.
 
     No specification is available.
 
     """
-
-    def keyindex(key: str, /) -> tuple[str, int]:
-        # split key into name and index
-        index = 0
-        i = len(key.rstrip('0123456789'))
-        if i < len(key):
-            index = int(key[i:]) - 1
-            key = key[:i]
-        return key, index
 
     result: dict[str, Any] = {}
     bands: list[dict[str, Any]] = []
@@ -947,7 +900,7 @@ def olympusini_metadata(inistr: str, /) -> dict[str, Any]:
                 if key == 'Count':
                     result['ASD'] = [{}] * value
                 else:
-                    key, index = keyindex(key)
+                    key, index = _keyindex(key)
                     result['ASD'][index][key] = value
             elif section_name == 'Band':
                 if key[:3] == 'LUT':
@@ -957,7 +910,7 @@ def olympusini_metadata(inistr: str, /) -> dict[str, Any]:
                         [ord(value[0:1]), ord(value[1:2]), ord(value[2:3])]
                     )
                 else:
-                    key, iband = keyindex(key)
+                    key, iband = _keyindex(key)
                     bands[iband][key] = value
             elif key[:4] == 'ZPos' and zpos is not None:
                 zpos.append(value)
@@ -993,14 +946,13 @@ def olympusini_metadata(inistr: str, /) -> dict[str, Any]:
         band['LUT'] = numpy.array(band['LUT'], numpy.uint8)
     return result
 
-def read_sis_ini(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_sis_ini(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read OlympusSIS INI string from file."""
     inistr = bytes2str(stripnull(fh.read(count)))
     try:
@@ -1010,14 +962,13 @@ def read_sis_ini(
         return {}
 
 
-def read_tvips_header(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_tvips_header(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read TVIPS EM-MENU headers from file."""
     result: dict[str, Any] = {}
     header_v1 = TIFF.TVIPS_HEADER_V1
@@ -1051,14 +1002,13 @@ def read_tvips_header(
     return result
 
 
-def read_fei_metadata(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_fei_metadata(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read FEI SFEG/HELIOS headers from file."""
     result: dict[str, Any] = {}
     section: dict[str, Any] = {}
@@ -1077,14 +1027,13 @@ def read_fei_metadata(
     return result
 
 
-def read_cz_sem(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_cz_sem(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read Zeiss SEM tag from file.
 
     See https://sourceforge.net/p/gwyddion/mailman/message/29275000/ for
@@ -1131,14 +1080,13 @@ def read_cz_sem(
     return result
 
 
-def read_nih_image_header(
-    fh: FileHandle,
-    byteorder: ByteOrder,
-    dtype: int,
-    count: int,
-    offsetsize: int,
-    /,
-) -> dict[str, Any]:
+cdef dict read_nih_image_header(
+    FileHandle fh,
+    ByteOrder byteorder,
+    int64_t datatype,
+    int64_t count,
+    int64_t offsetsize,
+):
     """Read NIH_IMAGE_HEADER tag value from file."""
     arr = fh.read_record(TIFF.NIH_IMAGE_HEADER, shape=1, byteorder=byteorder)
     arr = arr.view(arr.dtype.newbyteorder(byteorder))
@@ -1146,7 +1094,6 @@ def read_nih_image_header(
     result['XUnit'] = result['XUnit'][: result['XUnitSize']]
     result['UM'] = result['UM'][: result['UMsize']]
     return result
-
 
 
 cdef object read_tag(int32_t tag,
@@ -1157,37 +1104,16 @@ cdef object read_tag(int32_t tag,
                      int64_t count,
                      int64_t offsetsize):
     fh.seek(offset)
-    if (tag == 301
-        or tag == 320):
+    if tag in {301, 320}:
         return read_colormap(fh, byteorder, dtype, count, offsetsize)
-    elif (tag == 33723
-          or tag == 37724
-          or tag == 33923
-          or tag == 40100
-          or tag == 50288
-          or tag == 50296
-          or tag == 50839
-          or tag == 65459):
-        # read_bytes
-        count *= get_data_format_size(dtype)
-        data = fh.read(count)
-        if len(data) != count:
-            logger().warning(
-                '<tifffile.read_bytes> '
-                f'failed to read {count} bytes, got {len(data)})'
-            )
-        return data
-    elif (tag == 34363
-          or tag == 34386
-          or tag == 65426
-          or tag == 65432
-          or tag == 65439): # NDPI unknown
+    elif tag in {33723, 37724, 33923, 40100, 50288, 50296, 50839, 65459}:
+        return read_bytes(fh, byteorder, dtype, count, offsetsize)
+    elif tag in {34363, 34368, 65426, 65432, 65439}: # NDPI unknown
         return read_numpy(fh, byteorder, dtype, count, offsetsize)
-    elif (tag == 34680
-          or tag == 34682): # Helios NanoLab
+    elif tag in {34680, 34682}: # Helios NanoLab
         return read_fei_metadata(fh, byteorder, dtype, count, offsetsize)
     elif tag == 33628:
-        return read_uic1tag(fh, byteorder, dtype, count, offsetsize)  # Universal Imaging Corp STK
+        return read_uic1tag(fh, byteorder, dtype, count, offsetsize, 0)  # Universal Imaging Corp STK
     elif tag == 33629:
         return read_uic2tag(fh, byteorder, dtype, count, offsetsize)
     elif tag == 33630:
@@ -1894,7 +1820,7 @@ cdef class TiffTag:
             if dtype != self.dtype:
                 # rewrite data type
                 fh.seek(self.offset + 2)
-                fh.write(struct.pack(tiff.byteorder + 'H', dtype))
+                fh.write(struct.pack(tiff.byteorder_str + 'H', dtype))
 
             if oldsize <= tiff.tagoffsetthreshold:
                 if newsize <= tiff.tagoffsetthreshold:
