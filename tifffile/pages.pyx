@@ -9,7 +9,8 @@
 from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, free
 
-from .format cimport ByteOrder
+from .format cimport ByteOrder, TiffFormat
+from .files cimport FileHandle
 from .tags cimport TiffTag, TiffTags
 from .tags import read_uic1tag
 from .types import COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR,\
@@ -429,7 +430,7 @@ def imagej_metadata(
         )
     return result
 
-def jpeg_shape(jpeg: bytes) -> tuple[int, int, int, int]:
+cdef tuple jpeg_shape(bytes jpeg):
     """Return bitdepth and shape of JPEG image."""
     cdef int64_t i = 0
     cdef int64_t marker, length
@@ -606,6 +607,7 @@ def unpack_rgb(
         result[:, i] = t
     return result.reshape(-1)
 
+@cython.final
 cdef class TiffPage:
     """TIFF image file directory (IFD).
 
@@ -739,17 +741,19 @@ cdef class TiffPage:
         parent: TiffFile,
         index: int | Sequence[int],
         *,
-        keyframe: TiffPage | None = None,
+        TiffPage keyframe = None,
     ) -> None:
-        tag: TiffTag | None
-        tiff = parent.tiff
+        cdef TiffTag tag
+        cdef TiffFormat tiff = parent.tiff
+        cdef int64_t tagno
 
         self.parent = parent
         self.shape = ()
         self.shaped = (0, 0, 0, 0, 0)
         self.dtype = self._dtype = None
         self.axes = ''
-        self.tags = tags = TiffTags()
+        self.tags = TiffTags()
+        cdef TiffTags tags = self.tags
         self.dataoffsets = ()
         self.databytecounts = ()
         if isinstance(index, int):
@@ -758,10 +762,10 @@ cdef class TiffPage:
             self._index = tuple(index)
 
         # read IFD structure and its tags from file
-        fh = parent.filehandle
+        cdef FileHandle fh = parent.filehandle
         self.offset = fh.tell()  # offset to this IFD
         try:
-            tagno: int = struct.unpack(
+            tagno = struct.unpack(
                 tiff.tagnoformat, fh.read(tiff.tagnosize)
             )[0]
             if tagno > 4096:
@@ -769,10 +773,12 @@ cdef class TiffPage:
         except Exception as exc:
             raise TiffFileError(f'corrupted tag list @{self.offset}') from exc
 
-        tagoffset = self.offset + tiff.tagnosize  # fh.tell()
+        cdef int64_t tagoffset = self.offset + tiff.tagnosize  # fh.tell()
+        cdef int64_t tagsize, tagsize_
         tagsize = tagsize_ = tiff.tagsize
 
-        data = fh.read(tagsize * tagno)
+        cdef bytes data = fh.read(tagsize * tagno)
+        cdef bytes ext
         if len(data) != tagsize * tagno:
             raise TiffFileError('corrupted IFD structure')
         if tiff.is_ndpi:
@@ -804,6 +810,9 @@ cdef class TiffPage:
         if not tags:
             return  # found in FIBICS
 
+        cdef object value
+        cdef int64_t code
+        cdef str name
         for code, name in TIFF.TAG_ATTRIBUTES.items():
             value = tags.valueof(code)
             if value is None:
@@ -811,7 +820,7 @@ cdef class TiffPage:
             if code in {270, 305} and not isinstance(value, str):
                 # wrong string type for software or description
                 continue
-            setattr(self, name, value)
+            setattr(self, name, value) # TODO: maybe needs __dict__
 
         value = tags.valueof(270, default=None, index=1)
         if isinstance(value, str):
@@ -860,6 +869,8 @@ cdef class TiffPage:
                 # JPEGInterchangeFormatLength et al.
                 self.databytecounts = tags.valueof(514)
 
+        """
+        TODO: this code seems to use undefined variables
         if (
             self.imagewidth == 0
             and self.imagelength == 0
@@ -891,7 +902,9 @@ cdef class TiffPage:
                 if 278 not in tags:
                     self.rowsperstrip = imagelength
 
-        elif self.compression == 6:
+        el
+        """
+        if self.compression == 6:
             # OJPEG hack. See libtiff v4.2.0 tif_dirread.c#L4082
             if 262 not in tags:
                 # PhotometricInterpretation missing
@@ -1006,7 +1019,7 @@ cdef class TiffPage:
             #    self.rowsperstrip))
 
         # determine dtype
-        dtypestr = TIFF.SAMPLE_DTYPES.get(
+        cdef str dtypestr = TIFF.SAMPLE_DTYPES.get(
             (self.sampleformat, self.bitspersample), None
         )
         if dtypestr is not None:
@@ -1016,10 +1029,10 @@ cdef class TiffPage:
         self.dtype = self._dtype = dtype
 
         # determine shape of data
-        imagelength = self.imagelength
-        imagewidth = self.imagewidth
-        imagedepth = self.imagedepth
-        samplesperpixel = self.samplesperpixel
+        cdef int64_t imagelength = self.imagelength
+        cdef int64_t imagewidth = self.imagewidth
+        cdef int64_t imagedepth = self.imagedepth
+        cdef int64_t samplesperpixel = self.samplesperpixel
 
         if self.photometric == 2 or samplesperpixel > 1:  # PHOTOMETRIC.RGB
             if self.planarconfig == 1:
@@ -1076,6 +1089,7 @@ cdef class TiffPage:
             if self.compression != 1:
                 logger().error(f'{self!r} missing ByteCounts tag')
 
+        cdef int64_t maxstrips
         if imagelength and self.rowsperstrip and not self.is_lsm:
             # fix incorrect number of strip bytecounts and offsets
             maxstrips = (
@@ -1889,7 +1903,7 @@ cdef class TiffPage:
         """
         cdef TiffPage keyframe = self.keyframe  # self or keyframe
         cdef object result
-        cdef bint closed
+        cdef bint closed = False
         
         if 0 in tuple(keyframe.shaped) or keyframe._dtype is None:
             return numpy.empty((0,), keyframe.dtype)
