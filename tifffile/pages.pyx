@@ -743,7 +743,7 @@ cdef class TiffPage:
         *,
         TiffPage keyframe = None,
     ) -> None:
-        cdef TiffTag tag
+        cdef TiffTag tag, uic2tag
         cdef TiffFormat tiff = parent.tiff
         cdef int64_t tagno
 
@@ -800,7 +800,8 @@ cdef class TiffPage:
                     parent.filehandle,
                     parent.tiff,
                     offset=tagoffset + i * tagsize_,
-                    header=tagdata
+                    header=tagdata,
+                    validate=True
                 )
             except TiffFileError as exc:
                 logger().error(f'<TiffTag.fromfile> raised {exc!r:.128}')
@@ -906,16 +907,16 @@ cdef class TiffPage:
         """
         if self.compression == 6:
             # OJPEG hack. See libtiff v4.2.0 tif_dirread.c#L4082
-            if 262 not in tags:
+            if not tags.contains_code(262):
                 # PhotometricInterpretation missing
                 self.photometric = PHOTOMETRIC.YCBCR
             elif self.photometric == 2:
                 # RGB -> YCbCr
                 self.photometric = PHOTOMETRIC.YCBCR
-            if 258 not in tags:
+            if not tags.contains_code(258):
                 # BitsPerSample missing
                 self.bitspersample = 8
-            if 277 not in tags:
+            if not tags.contains_code(277):
                 # SamplesPerPixel missing
                 if self.photometric in {2, 6}:
                     self.samplesperpixel = 3
@@ -972,7 +973,7 @@ cdef class TiffPage:
         if value is not None:
             if self.bitspersample != 1:
                 pass  # bitspersample was set by ojpeg hack
-            elif tags[258].count == 1:
+            elif tags.get(258).count == 1:
                 self.bitspersample = int(value)
             else:
                 # LSM might list more items than samplesperpixel
@@ -1008,10 +1009,10 @@ cdef class TiffPage:
             # IndicaLabsImageWriter does not write SampleFormat tag
             self.sampleformat = SAMPLEFORMAT.IEEEFP
 
-        if 322 in tags:  # TileWidth
+        if tags.contains_code(322):  # TileWidth
             self.rowsperstrip = 0
-        elif 257 in tags:  # ImageLength
-            if 278 not in tags or tags[278].count > 1:  # RowsPerStrip
+        elif tags.contains_code(257):  # ImageLength
+            if not tags.contains_code(278) or tags.get(278).count > 1:  # RowsPerStrip
                 self.rowsperstrip = self.imagelength
             self.rowsperstrip = min(self.rowsperstrip, self.imagelength)
             # self.stripsperimage = int(math.floor(
@@ -1273,7 +1274,7 @@ cdef class TiffPage:
 
         if self.tags.get(339) is not None:
             tag = self.tags[339]  # SampleFormat
-            if tag.count != 1 and any(i - tag.value[0] for i in tag.value):
+            if tag.count != 1 and any(i - tag.value[0] for i in tag.value_get()):
 
                 def decode_raise_sampleformat(*args, **kwargs):
                     raise ValueError(
@@ -1982,8 +1983,8 @@ cdef class TiffPage:
                         f'{self!r} reading array from closed file', UserWarning
                     )
                     fh.open()
-                fh.seek(self.tags[273].value[0])  # StripOffsets
-                data = fh.read(self.tags[279].value[0])  # StripByteCounts
+                fh.seek(self.tags[273].value_get()[0])  # StripOffsets
+                data = fh.read(self.tags[279].value_get()[0])  # StripByteCounts
             decompress = DECOMPRESSORS[self.compression]
             result = decompress(
                 data,
@@ -2671,16 +2672,17 @@ cdef class TiffPage:
     @property#@cached_property
     def andor_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from Andor tags."""
+        cdef TiffTag tag
         if not self.is_andor:
             return None
-        result = {'Id': self.tags[4864].value}  # AndorId
-        for tag in self.tags:  # list(self.tags.values()):
+        result = {'Id': self.tags[4864].value_get()}  # AndorId
+        for tag in self.tags.values():
             code = tag.code
             if not 4864 < code < 5031:
                 continue
             name = tag.name
             name = name[5:] if len(name) > 5 else name
-            result[name] = tag.value
+            result[name] = tag.value_get()
             # del self.tags[code]
         return result
 

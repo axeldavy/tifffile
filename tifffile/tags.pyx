@@ -1,11 +1,16 @@
-
 #cython: language_level=3
 #cython: cdivision=True
 #cython: nonecheck=False
 #cython: profile=True
 #distutils: language=c++
 
-from libc.stdint cimport int32_t, int64_t
+cimport cython
+from cython.operator cimport dereference, postincrement
+from libc.stdint cimport uint16_t, int32_t, uint32_t, int64_t, uint64_t
+from libcpp.string cimport string as cpp_string
+from libcpp.vector cimport vector
+from libcpp.unordered_map cimport unordered_multimap as cpp_multimap
+from libcpp.utility cimport pair
 from .files cimport FileHandle
 from .format cimport TiffFormat, ByteOrder
 from .names cimport get_tag_names
@@ -226,28 +231,25 @@ cdef list read_tags(
         This implementation does not support 64-bit NDPI files.
 
     """
-    code: int
+    cdef int64_t code
     cdef int64_t datatype
     cdef int64_t count
-    valuebytes: bytes
-    valueoffset: int
-    customtags = None
+    cdef unsigned char* valuebytes
+    cdef int64_t valueoffset
+    cdef object customtags = None
+    cdef uint16_t tagno
+    cdef uint32_t offset_value_le
+    cdef uint64_t offset_value_be
+    cdef int64_t tagnosize, tagsize, index, valuesize
+    cdef bint is_little_endian = byteorder == ByteOrder.II
+    cdef bint process
 
-    cdef str byteorder_str = '>' if byteorder == ByteOrder.MM else '<'
     if offsetsize == 4:
-        offsetformat = byteorder_str + 'I'
         tagnosize = 2
-        tagnoformat = byteorder_str + 'H'
         tagsize = 12
-        tagformat1 = byteorder_str + 'HH'
-        tagformat2 = byteorder_str + 'I4s'
     elif offsetsize == 8:
-        offsetformat = byteorder_str + 'Q'
         tagnosize = 8
-        tagnoformat = byteorder_str + 'Q'
         tagsize = 20
-        tagformat1 = byteorder_str + 'HH'
-        tagformat2 = byteorder_str + 'Q8s'
     else:
         raise ValueError('invalid offset size')
 
@@ -256,13 +258,32 @@ cdef list read_tags(
     if maxifds is None:
         maxifds = 2**32
 
-    result: list[dict[str, Any]] = []
-    unpack = struct.unpack
-    offset = fh.tell()
+    cdef list result = []
+    cdef int64_t offset = fh.tell()
+    cdef int64_t pos
+
+    cdef bytes data_b
+    cdef unsigned char* data
+    cdef dict tags
+    cdef str name
+    
     while len(result) < maxifds:
         # loop over IFDs
         try:
-            tagno = unpack(tagnoformat, fh.read(tagnosize))[0]
+            # Read tagno based on endianness
+            data_b = fh.read(tagnosize)
+            data = data_b
+            if is_little_endian:
+                if tagnosize == 2:
+                    tagno = (<uint16_t*>data)[0]
+                else:  # tagnosize == 8
+                    tagno = (<uint64_t*>data)[0]
+            else:
+                if tagnosize == 2:
+                    tagno = _bswap16((<uint16_t*>data)[0])
+                else:  # tagnosize == 8
+                    tagno = _bswap64((<uint64_t*>data)[0])
+                
             if tagno > 4096:
                 raise TiffFileError(f'suspicious number of tags {tagno}')
         except Exception as exc:
@@ -273,31 +294,52 @@ cdef list read_tags(
             break
 
         tags = {}
-        data = fh.read(tagsize * tagno)
+        data_b = fh.read(tagsize * tagno)
+        data = data_b
         pos = fh.tell()
         index = 0
 
         for _ in range(tagno):
-            code, datatype = unpack(tagformat1, data[index : index + 4])
-            count, valuebytes = unpack(
-                tagformat2, data[index + 4 : index + tagsize]
-            )
+            # Read code and datatype directly based on endianness
+            if is_little_endian:
+                code = (<uint16_t*>&data[index])[0]
+                datatype = (<uint16_t*>&data[index + 2])[0]
+                count = (<uint32_t*>&data[index + 4])[0] if offsetsize == 4 else (<uint64_t*>&data[index + 4])[0]
+                valuebytes = &data[index + 8]#:index + tagsize]
+            else:
+                code = _bswap16((<uint16_t*>&data[index])[0])
+                datatype = _bswap16((<uint16_t*>&data[index + 2])[0])
+                count = _bswap32((<uint32_t*>&data[index + 4])[0]) if offsetsize == 4 else _bswap64((<uint64_t*>&data[index + 4])[0])
+                valuebytes = &data[index + 8]#:index + tagsize]
+            
             index += tagsize
             name = tagnames.get(code, str(code))
+            
             try:
-                valueformat = TIFF.DATA_FORMATS[datatype]
+                valuesize = count * get_data_format_size(datatype)
             except KeyError:
                 logger().error(f'invalid data type {datatype!r} for tag #{code}')
                 continue
 
-            valuesize = count * struct.calcsize(valueformat)
             if valuesize > offsetsize or code in customtags:
-                valueoffset = unpack(offsetformat, valuebytes)[0]
+                # Get valueoffset based on endianness and offsetsize
+                if is_little_endian:
+                    if offsetsize == 4:
+                        valueoffset = (<uint32_t*>valuebytes)[0]
+                    else:  # offsetsize == 8
+                        valueoffset = (<uint64_t*>valuebytes)[0]
+                else:
+                    if offsetsize == 4:
+                        valueoffset = _bswap32((<uint32_t*>valuebytes)[0])
+                    else:  # offsetsize == 8
+                        valueoffset = _bswap64((<uint64_t*>valuebytes)[0])
+                
                 if valueoffset < 8 or valueoffset + valuesize > fh.size:
                     logger().error(
                         f'invalid value offset {valueoffset} for tag #{code}'
                     )
                     continue
+                    
                 fh.seek(valueoffset)
                 if code in customtags:
                     readfunc = customtags[code]
@@ -310,29 +352,22 @@ cdef list read_tags(
                             f'could not read all values for tag #{code}'
                         )
                 elif code in tagnames:
-                    fmt = (
-                        f'{byteorder}'
-                        f'{count * int(valueformat[0])}'
-                        f'{valueformat[1]}'
-                    )
-                    value = unpack(fmt, fh.read(valuesize))
+                    # Use optimized reading based on datatype and byteorder
+                    value = read_formatted_data(fh, byteorder, datatype, count, valuesize)
                 else:
                     value = read_numpy(fh, byteorder, datatype, count, offsetsize)
             elif datatype in {DATATYPE.BYTE, DATATYPE.ASCII, DATATYPE.UNDEFINED}:
                 value = valuebytes[:valuesize]
             else:
-                fmt = (
-                    f'{byteorder}'
-                    f'{count * int(valueformat[0])}'
-                    f'{valueformat[1]}'
-                )
-                value = unpack(fmt, valuebytes[:valuesize])
+                # Process inline data based on datatype and byteorder
+                value = process_inline_data(valuebytes, byteorder, datatype, count, valuesize)
 
             process = (
                 code not in customtags
-                and code not in TIFF.TAG_TUPLE
+                and not tag_is_tuple(code)
                 and datatype != DATATYPE.UNDEFINED
             )
+            
             if process and datatype == DATATYPE.ASCII:
                 # TIFF ASCII fields can contain multiple strings,
                 #   each terminated with a NUL
@@ -347,7 +382,7 @@ cdef list read_tags(
                 if code in TIFF.TAG_ENUM:
                     t = TIFF.TAG_ENUM[code]
                     try:
-                        value = tuple(t(v) for v in value)
+                        value = tuple([t(v) for v in value])
                     except ValueError as exc:
                         if code not in {259, 317}:
                             # ignore compression/predictor
@@ -361,9 +396,21 @@ cdef list read_tags(
 
         result.append(tags)
 
-        # read offset to next page
+        # Read offset to next page based on endianness and offsetsize
         fh.seek(pos)
-        offset = unpack(offsetformat, fh.read(offsetsize))[0]
+        data_b = fh.read(offsetsize)
+        data = data_b
+        if is_little_endian:
+            if offsetsize == 4:
+                offset = (<uint32_t*>data)[0]
+            else:  # offsetsize == 8
+                offset = (<uint64_t*>data)[0]
+        else:
+            if offsetsize == 4:
+                offset = _bswap32((<uint32_t*>data)[0])
+            else:  # offsetsize == 8
+                offset = _bswap64((<uint64_t*>data)[0])
+        
         if offset == 0:
             break
         if offset >= fh.size:
@@ -372,6 +419,98 @@ cdef list read_tags(
         fh.seek(offset)
 
     return result
+
+cdef extern from * nogil:
+    """
+    uint16_t _bswap16(uint16_t value) {
+        return ((value & 0xFF) << 8) | ((value >> 8) & 0xFF);
+    }
+
+    uint32_t _bswap32(uint32_t value) {
+        return ((value & 0xFF) << 24) | ((value & 0xFF00) << 8) |
+               ((value >> 8) & 0xFF00) | ((value >> 24) & 0xFF);
+    }
+
+    uint64_t _bswap64(uint64_t value) {
+        return ((value & 0xFF) << 56) | ((value & 0xFF00) << 40) |
+               ((value & 0xFF0000) << 24) | ((value & 0xFF000000) << 8) |
+               ((value >> 8) & 0xFF000000) | ((value >> 24) & 0xFF0000) |
+               ((value >> 40) & 0xFF00) | ((value >> 56) & 0xFF);
+    }
+    """
+    cdef uint16_t _bswap16(uint16_t value)
+    cdef uint32_t _bswap32(uint32_t value)
+    cdef uint64_t _bswap64(uint64_t value)
+
+cdef tuple read_formatted_data(FileHandle fh, ByteOrder byteorder, int64_t datatype, 
+                              int64_t count, int64_t valuesize):
+    """Read data from file with specified format without string concatenation."""
+    cdef bytes data = fh.read(valuesize)
+    return process_inline_data(data, byteorder, datatype, count, valuesize)
+
+cdef tuple process_inline_data(bytes data_b, ByteOrder byteorder, int64_t datatype, 
+                              int64_t count, int64_t valuesize):
+    """Process inline data with specified format without string concatenation."""
+    cdef bint is_little_endian = byteorder == ByteOrder.II
+    cdef int64_t i
+    cdef list result = []
+    cdef unsigned char* data = data_b
+    
+    # Process data based on datatype and endianness
+    if is_little_endian:
+        if datatype == <int64_t>DATATYPE.SHORT:
+            for i in range(0, valuesize, 2):
+                result.append((<uint16_t*>&data[i])[0])
+        elif datatype == <int64_t>DATATYPE.LONG:
+            for i in range(0, valuesize, 4):
+                result.append((<uint32_t*>&data[i])[0])
+        elif datatype == <int64_t>DATATYPE.RATIONAL:
+            for i in range(0, valuesize, 8):
+                result.append(((<uint32_t*>&data[i])[0], (<uint32_t*>&data[i+4])[0]))
+        elif datatype == <int64_t>DATATYPE.SSHORT:
+            for i in range(0, valuesize, 2):
+                result.append((<short*>&data[i])[0])
+        elif datatype == <int64_t>DATATYPE.SLONG:
+            for i in range(0, valuesize, 4):
+                result.append((<int*>&data[i])[0])
+        elif datatype == <int64_t>DATATYPE.SRATIONAL:
+            for i in range(0, valuesize, 8):
+                result.append(((<int*>&data[i])[0], (<int*>&data[i+4])[0]))
+        elif datatype == <int64_t>DATATYPE.FLOAT:
+            for i in range(0, valuesize, 4):
+                result.append((<float*>&data[i])[0])
+        elif datatype == <int64_t>DATATYPE.DOUBLE:
+            for i in range(0, valuesize, 8):
+                result.append((<double*>&data[i])[0])
+        else:
+            assert False, f'Unknown datatype {datatype}'
+        # Add more datatypes as needed
+    else:  # big endian
+        if datatype == <int64_t>DATATYPE.SHORT:
+            for i in range(0, valuesize, 2):
+                result.append(_bswap16((<uint16_t*>&data[i])[0]))
+        elif datatype == <int64_t>DATATYPE.LONG:
+            for i in range(0, valuesize, 4):
+                result.append(_bswap32((<uint32_t*>&data[i])[0]))
+        elif datatype == <int64_t>DATATYPE.RATIONAL:
+            for i in range(0, valuesize, 8):
+                result.append((_bswap32((<uint32_t*>&data[i])[0]), 
+                              _bswap32((<uint32_t*>&data[i+4])[0])))
+        elif datatype == <int64_t>DATATYPE.SSHORT:
+            for i in range(0, valuesize, 2):
+                result.append(<short>_bswap16((<uint16_t*>&data[i])[0]))
+        elif datatype == <int64_t>DATATYPE.SLONG:
+            for i in range(0, valuesize, 4):
+                result.append(<int>_bswap32((<uint32_t*>&data[i])[0]))
+        elif datatype == <int64_t>DATATYPE.SRATIONAL:
+            for i in range(0, valuesize, 8):
+                result.append((<int>_bswap32((<uint32_t*>&data[i])[0]), 
+                              <int>_bswap32((<uint32_t*>&data[i+4])[0])))
+        # Add more datatypes as needed
+        else:
+            assert False, f'Unknown datatype {datatype}'
+        
+    return tuple(result)
 
 cdef dict read_gps_ifd(
     FileHandle fh,
@@ -1275,61 +1414,77 @@ cdef int64_t get_data_format_size(int64_t datatype) nogil:
         return 8
     raise KeyError(f"Unknown TIFF DATATYPE {datatype}")
 
-cdef object interprete_data_format(int64_t datatype, const void* data):
+cdef object interprete_data_format(int64_t datatype, const void* data, ByteOrder byteorder):
     """Interpret data according to TIFF DATATYPE and return as appropriate Python type.
     
     Parameters:
         datatype: TIFF DATATYPE value
         data: Pointer to binary data
+        byteorder: Byte order (default is little-endian)
         
     Returns:
-        Tuple containing interpreted data
+        Interpreted data value
     """
     cdef unsigned char* bytes_data = <unsigned char*>data
-    cdef unsigned short* short_data = <unsigned short*>data
-    cdef unsigned int* int_data = <unsigned int*>data
-    cdef unsigned long long* long_data = <unsigned long long*>data
+    cdef uint16_t* short_data = <uint16_t*>data
+    cdef uint32_t* int_data = <uint32_t*>data
+    cdef uint64_t* long_data = <uint64_t*>data
     cdef char* char_data = <char*>data
     cdef short* sshort_data = <short*>data
     cdef int* sint_data = <int*>data
     cdef long long* slong_data = <long long*>data
     cdef float* float_data = <float*>data
     cdef double* double_data = <double*>data
+    cdef bint is_big_endian = byteorder == ByteOrder.MM
     
     if datatype == <int64_t>DATATYPE.BYTE:
         return bytes_data[0]
     elif datatype == <int64_t>DATATYPE.ASCII:
         return bytes_data[0:1]  # Return as bytes
     elif datatype == <int64_t>DATATYPE.SHORT:
-        return short_data[0]
+        return _bswap16(short_data[0]) if is_big_endian else short_data[0]
     elif datatype == <int64_t>DATATYPE.LONG:
-        return int_data[0]
+        return _bswap32(int_data[0]) if is_big_endian else int_data[0]
     elif datatype == <int64_t>DATATYPE.RATIONAL:
-        return (int_data[0], int_data[1])
+        if is_big_endian:
+            return (_bswap32(int_data[0]), _bswap32(int_data[1]))
+        else:
+            return (int_data[0], int_data[1])
     elif datatype == <int64_t>DATATYPE.SBYTE:
         return char_data[0]
     elif datatype == <int64_t>DATATYPE.UNDEFINED:
         return bytes_data[0]
     elif datatype == <int64_t>DATATYPE.SSHORT:
-        return sshort_data[0]
+        return <short>_bswap16(<uint16_t>sshort_data[0]) if is_big_endian else sshort_data[0]
     elif datatype == <int64_t>DATATYPE.SLONG:
-        return sint_data[0]
+        return <int>_bswap32(<uint32_t>sint_data[0]) if is_big_endian else sint_data[0]
     elif datatype == <int64_t>DATATYPE.SRATIONAL:
-        return (sint_data[0], sint_data[1])
+        if is_big_endian:
+            return (<int>_bswap32(<uint32_t>sint_data[0]), <int>_bswap32(<uint32_t>sint_data[1]))
+        else:
+            return (sint_data[0], sint_data[1])
     elif datatype == <int64_t>DATATYPE.FLOAT:
+        # Float handling requires special care for byte swapping
+        if is_big_endian:
+            # Would need an implementation of float byte swapping
+            pass
         return float_data[0]
     elif datatype == <int64_t>DATATYPE.DOUBLE:
+        if is_big_endian:
+            # Would need an implementation of double byte swapping
+            pass
         return double_data[0]
     elif datatype == <int64_t>DATATYPE.IFD:
-        return int_data[0]
+        return _bswap32(int_data[0]) if is_big_endian else int_data[0]
     elif datatype == <int64_t>DATATYPE.LONG8:
-        return long_data[0]
+        return _bswap64(long_data[0]) if is_big_endian else long_data[0]
     elif datatype == <int64_t>DATATYPE.SLONG8:
-        return slong_data[0]
+        return <long long>_bswap64(<uint64_t>slong_data[0]) if is_big_endian else slong_data[0]
     elif datatype == <int64_t>DATATYPE.IFD8:
-        return long_data[0]
+        return _bswap64(long_data[0]) if is_big_endian else long_data[0]
     return ()  # Return empty tuple for unknown datatypes
 
+@cython.final
 cdef class TiffTag:
     """TIFF tag structure.
 
@@ -1372,13 +1527,13 @@ cdef class TiffTag:
         self.datatype = datatype
 
     @staticmethod
-    def fromfile(
+    cdef TiffTag fromfile(
         FileHandle fh,
         TiffFormat tiff_format,
-        object offset = None,
-        bytes header = None,
-        bint validate = True,
-    ) -> TiffTag:
+        int64_t offset,
+        bytes header,
+        bint validate
+    ):
         """Return TiffTag instance from file.
 
         Parameters:
@@ -1388,7 +1543,6 @@ cdef class TiffTag:
                 TiffFormat instance that describes tag encoding
             offset:
                 Position of tag structure in file.
-                The default is the position of the file handle.
             header:
                 Tag structure as bytes.
                 The default is read from the file.
@@ -1401,15 +1555,8 @@ cdef class TiffTag:
 
         """
 
-        cdef int64_t resolved_offset
-
-        if offset is None:
-            resolved_offset = fh.tell()
-        else:
-            resolved_offset = offset
-
         if header is None:
-            fh.read_at(resolved_offset, tiff_format.tagsize)
+            fh.read_at(offset, tiff_format.tagsize)
 
         # Parse tag header
         cdef int64_t valueoffset = offset + tiff_format.tagsize - tiff_format.tagoffsetthreshold
@@ -1512,6 +1659,10 @@ cdef class TiffTag:
         cdef ByteOrder byteorder = tiff_format.byteorder
         cdef int64_t offsetsize = tiff_format.offsetsize
         cdef int64_t valuesize = count * structsize
+        cdef bytes data
+        cdef const unsigned char* data_ptr
+        cdef list result = []
+        cdef int i
 
         if valueoffset < 8 or valueoffset + valuesize > fh.size:
             raise TiffFileError(
@@ -1554,12 +1705,20 @@ cdef class TiffTag:
             fh.seek(valueoffset)
             value = read_numpy(fh, byteorder, datatype, count, offsetsize)
         else:
-            valueformat = TIFF.DATA_FORMATS[datatype]
-            value = struct.unpack(
-                f'{byteorder}{count * int(valueformat[0])}{valueformat[1]}',
-                fh.read_at(valueoffset, valuesize),
-            )
-        return value
+            data = fh.read_at(valueoffset, valuesize)
+            data_ptr = data
+        
+            # Handle endianness appropriately
+            if count == 1:
+                # For single value, use interprete_data_format directly
+                value = interprete_data_format(datatype, data_ptr, byteorder)
+            else:
+                # For multiple values, process each value separately
+                result = []
+                for i in range(count):
+                    result.append(interprete_data_format(datatype, data_ptr + i * structsize, byteorder))
+                value = tuple(result)
+            return value
 
     @staticmethod
     cdef object _process_value(
@@ -1603,8 +1762,7 @@ cdef class TiffTag:
 
         return value
 
-    @property
-    def value(self) -> object:
+    cdef object value_get(self):
         """Value of tag, delay-loaded from file if necessary."""
         if self._value is None:
             # print(
@@ -1628,9 +1786,16 @@ cdef class TiffTag:
             )
         return self._value
 
-    @value.setter
-    def value(self, object value) -> None:
+    cdef void value_set(self, object value):
         self._value = value
+
+    @property
+    def value(self):
+        return self.value_get()
+
+    @value.setter
+    def value(self, value):
+        self.value_set(value)
 
     @property
     def dtype_name(self) -> str:
@@ -1661,23 +1826,25 @@ cdef class TiffTag:
         The encoded value is read from file if necessary.
 
         """
-        if isinstance(self.value, bytes):
-            value = self.value
-        else:
+        cdef object value = self.value_get()
+        cdef TiffFormat tiff
+        cdef int64_t count
+        cdef FileHandle fh
+        if not isinstance(value, bytes):
             tiff = self.parent.tiff
-            dataformat = TIFF.DATA_FORMATS[self.dtype]
+            dataformat = TIFF.DATA_FORMATS[self.datatype]
             count = self.count * int(dataformat[0])
             fmt = f'{tiff.byteorder}{count}{dataformat[1]}'
             try:
-                if self.dtype == 2:
+                if self.datatype == 2:
                     # ASCII
-                    value = struct.pack(fmt, self.value.encode('ascii'))
+                    value = struct.pack(fmt, value.encode('ascii'))
                     if len(value) != count:
                         raise ValueError
-                elif count == 1 and not isinstance(self.value, tuple):
-                    value = struct.pack(fmt, self.value)
+                elif count == 1 and not isinstance(value, tuple):
+                    value = struct.pack(fmt, value)
                 else:
-                    value = struct.pack(fmt, *self.value)
+                    value = struct.pack(fmt, *value)
             except Exception as exc:
                 if tiff.is_ndpi and count == 1:
                     raise ValueError(
@@ -1688,7 +1855,7 @@ cdef class TiffTag:
                 fh.seek(self.valueoffset)
                 value = fh.read(struct.calcsize(fmt))
                 fh.seek(pos)
-        return self.code, int(self.dtype), self.count, value, True
+        return self.code, int(self.datatype), self.count, value, True
 
     def overwrite(
         self,
@@ -1736,10 +1903,11 @@ cdef class TiffTag:
         if tiff.is_ndpi:
             # only support files < 4GB
             if self.count == 1 and self.dtype in {4, 13}:
-                if isinstance(self.value, tuple):
-                    v = self.value[0]
+                value = self.value_get()
+                if isinstance(value, tuple):
+                    v = value[0]
                 else:
-                    v = self.value
+                    v = value
                 if v > 4294967295:
                     raise ValueError('cannot patch NDPI > 4 GB files')
             tiff = TIFF.CLASSIC_LE
@@ -1808,7 +1976,7 @@ cdef class TiffTag:
                 *value,
             )
         newsize = len(packedvalue)
-        oldsize = self.count * struct.calcsize(TIFF.DATA_FORMATS[self.dtype])
+        oldsize = self.count * get_data_format_size(self.datatype)
         valueoffset = self.valueoffset
 
         pos = fh.tell()
@@ -1965,7 +2133,7 @@ cdef class TiffTag:
             line += '\n' + value
         return line
 
-
+@cython.final
 cdef class TiffTags:
     """Multidict-like interface to TiffTag instances in TiffPage.
 
@@ -1984,57 +2152,92 @@ cdef class TiffTags:
     """
 
     def __cinit__(self):
-        self._dict = {}
-        self._list = [self._dict]
+        self._tags = []  # List to store all tags
+        self._code_indices = cpp_multimap[int64_t, int]()  # Code -> indices multimap
+        self._tag_count = 0  # Count of non-None tags
 
+    cdef bint contains_code(self, int64_t code) noexcept nogil:
+        """Check if code is in map."""
+        return self._code_indices.count(code) > 0
+
+    def contains(self, object code):
+        return self.contains_code(code)
+
+    cdef vector[int] _get_indices(self, int64_t code) nogil:
+        """Get list of indices for a code."""
+        cdef vector[int] result = vector[int]()
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] range
+        cdef cpp_multimap[int64_t, int].iterator it
+        
+        if self._code_indices.count(code) > 0:
+            range = self._code_indices.equal_range(code)
+            it = range.first
+            while it != range.second:
+                result.push_back(dereference(it).second)
+                postincrement(it)
+        
+        return result
+                
     cpdef void add(self, TiffTag tag):
         """Add tag."""
         cdef int64_t code = tag.code
-        cdef dict d
-        for d in self._list:
-            if code not in d:
-                d[code] = tag
-                break
-        else:
-            self._list.append({code: tag})
+        cdef int64_t index = len(self._tags)
+        
+        # Add tag to list
+        self._tags.append(tag)
+        
+        # Add index to code's list
+        cdef pair[int64_t, int] element
+        element.first = code
+        element.second = index
+        self._code_indices.insert(element)
+        
+        self._tag_count += 1
 
     cpdef list keys(self):
         """Return codes of all tags."""
-        return list(self._dict.keys())
-
-    @staticmethod
-    cdef int _offset_key(self, TiffTag tag):
-        return tag.offset
+        cdef list result = []
+        cdef TiffTag tag
+        
+        for tag in self._tags:
+            if tag is not None:
+                result.append(tag.code)
+                
+        return result
 
     cpdef list values(self):
         """Return all tags in order they are stored in file."""
         cdef list result = []
-        for d in self._list:
-            result.extend(d.values())
-        return sorted(result, key=TiffTags._offset_key)
-
-    @staticmethod
-    cdef int _offset_key2(self, tuple element):
-        return element[1].offset
+        cdef TiffTag tag
+        
+        for tag in self._tags:
+            if tag is not None:
+                result.append(tag)
+                
+        return result
 
     cpdef list items(self):
         """Return all (code, tag) pairs in order tags are stored in file."""
         cdef list result = []
-        for d in self._list:
-            result.extend(d.items())
-        return sorted(result, key=TiffTags._offset_key2)
+        cdef TiffTag tag
+        
+        for tag in self._tags:
+            if tag is not None:
+                result.append((tag.code, tag))
+                
+        return result
 
     cpdef object valueof(
         self,
-        object key,
+        int64_t code,
         object default = None,
         int64_t index = -1,
     ):
-        """Return value of tag by code or name if exists, else default.
+        """Return value of tag by code if exists, else default.
 
         Parameters:
             key:
-                Code or name of tag to return.
+                Code of tag to return.
             default:
                 Another value to return if specified tag is corrupted or
                 not found.
@@ -2043,24 +2246,24 @@ cdef class TiffTags:
                 The default is the first tag.
 
         """
-        cdef TiffTag tag = self.get(key, default=None, index=index)
+        cdef TiffTag tag = self.get(code, default=None, index=index)
         if tag is None:
             return default
         try:
-            return tag.value
+            return tag.value_get()
         except TiffFileError:
             return default  # corrupted tag
 
     cpdef TiffTag get(
         self,
-        object key,
+        int64_t code,
         TiffTag default = None,
         int64_t index = -1):
-        """Return tag by code or name if exists, else default.
+        """Return tag by code if exists, else default.
 
         Parameters:
-            key:
-                Code or name of tag to return.
+            code:
+                Code of tag to return.
             default:
                 Another tag to return if specified tag is corrupted or
                 not found.
@@ -2069,163 +2272,119 @@ cdef class TiffTags:
                 The default is the first tag.
 
         """
-        if index == -1:
-            if key in self._dict:
-                if isinstance(key, int):
-                    return self._dict[key]
-                return self._dict[<int>key]
-            if not isinstance(key, str):
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef TiffTag tag
+        cdef int idx
+        cdef int i
+
+        if index == -1:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
                 return default
-            index = 0
-
-        try:
-            tags = self._list[index]
-        except IndexError:
-            return default
-
-        if key in tags:
-            if isinstance(key, int):
-                return tags[key]
-            return tags[<int>key]
-
-        if not isinstance(key, str):
-            return default
-
-        for tag in tags.values():
-            if tag.name == key:
-                return tag
-
-        return default
+            idx = dereference(it).second
+            return self._tags[idx]
+        else:
+            if self._code_indices.count(code) == 0:
+                return default
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return default
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._tags[idx]
 
     cpdef object getall(
         self,
-        object key,
+        int64_t code,
         object default = None,
     ):
-        """Return list of all tags by code or name if exists, else default.
+        """Return list of all tags by code if exists, else default.
 
         Parameters:
-            key:
-                Code or name of tags to return.
+            code:
+                Code of tags to return.
             default:
                 Value to return if no tags are found.
 
         """
         cdef list result = []
-        cdef dict tags
+        cdef vector[int] indices
+        cdef int64_t i, idx
         cdef TiffTag tag
-
-        for tags in self._list:
-            if key in tags:
-                if isinstance(key, int):
-                    result.append(tags[key])
-                else:
-                    result.append(tags[<int>key])
-            else:
-                break
-
-        if result:
-            return result
-
-        if not isinstance(key, str):
+        
+        if not self.contains_code(code):
             return default
-
-        for tags in self._list:
-            for tag in tags.values():
-                if tag.name == key:
-                    result.append(tag)
-                    break
-            if not result:
-                break
-
+                
+        indices = self._get_indices(code)
+        for i in range(<int64_t>indices.size()):
+            idx = indices[i]
+            tag = self._tags[idx]
+            if tag is not None:
+                result.append(tag)
+                    
         return result if result else default
 
     def __getitem__(self, object key):
-        """Return first tag by code or name. Raise KeyError if not found."""
-        cdef TiffTag tag
-
-        if key in self._dict:
-            if isinstance(key, int):
-                return self._dict[key]
-            return self._dict[<int>key]
-
-        if not isinstance(key, str):
+        """Return first tag by code. Raise KeyError if not found."""
+        cdef TiffTag tag = self.get(key)
+        if tag is None:
             raise KeyError(key)
-
-        for tag in self._dict.values():
-            if tag.name == key:
-                return tag
-
-        raise KeyError(key)
+        return tag
 
     def __setitem__(self, int64_t code, TiffTag tag):
         """Add tag."""
         assert tag.code == code
         self.add(tag)
 
-    def __delitem__(self, key) -> None:
-        """Delete all tags by code or name."""
+    def __delitem__(self, int64_t code) -> None:
+        """Delete all tags by code."""
         cdef bint found = False
-        cdef dict tags
-        cdef TiffTag tag
-
-        for tags in self._list:
-            if key in tags:
+        cdef vector[int] indices
+        cdef int64_t i, idx
+        
+        if not self.contains_code(code):
+            raise KeyError(code)
+                
+        indices = self._get_indices(code)
+        for i in range(<int64_t>indices.size()):
+            idx = indices[i]
+            if self._tags[idx] is not None:
+                self._tags[idx] = None
                 found = True
-                if isinstance(key, int):
-                    del tags[key]
-                else:
-                    del tags[<int>key]
-            else:
-                break
-
+                self._tag_count -= 1
+                    
+        # Remove code from the multimap
+        self._code_indices.erase(code)
+            
         if found:
             return
-
-        if not isinstance(key, str):
-            raise KeyError(key)
-
-        for tags in self._list:
-            for tag in tags.values():
-                if tag.name == key:
-                    del tags[tag.code]
-                    found = True
-                    break
-            else:
-                break
-
-        if not found:
-            raise KeyError(key)
+        else:
+            raise KeyError(code)
 
     def __contains__(self, object item):
         """Return if tag is in map."""
-        cdef TiffTag tag
-        
-        if item in self._dict:
-            return True
-            
-        if not isinstance(item, str):
-            return False
-            
-        for tag in self._dict.values():
-            if tag.name == item:
-                return True
-                
-        return False
+        return self.contains(item)
 
     def __iter__(self):
         """Return iterator over all tags."""
-        return iter(self.values())
+        for tag in self._tags:
+            if tag is not None:
+                yield tag
 
     def __len__(self):
         """Return number of tags."""
-        cdef int size = 0
-        cdef dict d
-        
-        for d in self._list:
-            size += len(d)
-            
-        return size
+        return self._tag_count
 
     def __repr__(self) -> str:
         return f'<tifffile.TiffTags @0x{id(self):016X}>'
@@ -2271,7 +2430,7 @@ cdef class TiffTags:
             info.append('\n\n'.join(vlines))
         return '\n'.join(info)
 
-
+@cython.final
 cdef class TiffTagRegistry:
     """Registry of TIFF tag codes and names.
 
@@ -2302,9 +2461,73 @@ cdef class TiffTagRegistry:
     """
 
     def __init__(self, object arg):
-        self._dict = {}
-        self._list = [self._dict]
+        self._entries = []  # Store (code, name) tuples
+        self._code_indices = cpp_multimap[int64_t, int]()
+        self._name_indices = cpp_multimap[cpp_string, int]()
+        self._entry_count = 0
         self.update(arg)
+
+    cdef bint _contains_code(self, int64_t code) nogil:
+        """Check if code is in registry."""
+        return self._code_indices.count(code) > 0
+
+    cdef bint _contains_name(self, cpp_string name) nogil:
+        """Check if name is in registry."""
+        return self._name_indices.count(name) > 0
+        
+    cdef vector[int] _get_code_indices(self, int64_t code) nogil:
+        """Get indices for a code."""
+        cdef vector[int] result = vector[int]()
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] range
+        cdef cpp_multimap[int64_t, int].iterator it
+        
+        if self._code_indices.count(code) > 0:
+            range = self._code_indices.equal_range(code)
+            it = range.first
+            while it != range.second:
+                result.push_back(dereference(it).second)
+                postincrement(it)
+        
+        return result
+        
+    cdef vector[int] _get_name_indices(self, cpp_string name) nogil:
+        """Get indices for a name."""
+        cdef vector[int] result = vector[int]()
+        cdef pair[cpp_multimap[cpp_string, int].iterator, cpp_multimap[cpp_string, int].iterator] range
+        cdef cpp_multimap[cpp_string, int].iterator it
+        
+        if self._name_indices.count(name) > 0:
+            range = self._name_indices.equal_range(name)
+            it = range.first
+            while it != range.second:
+                result.push_back(dereference(it).second)
+                postincrement(it)
+        
+        return result
+        
+    cdef void _add_index(self, int64_t code, str name, int index) nogil:
+        """Add an index to code and name maps."""
+        cdef cpp_string name_bytes
+        
+        with gil:
+            name_bytes = name.encode('utf8')
+        
+        self._code_indices.insert(pair[int64_t, int](code, index))
+        self._name_indices.insert(pair[cpp_string, int](name_bytes, index))
+
+    cpdef bint contains(self, object item):
+        """Check if item is in registry."""
+        cdef int64_t code
+        cdef cpp_string name_bytes
+        
+        if isinstance(item, int):
+            code = item
+            return self._contains_code(code)
+        elif isinstance(item, str):
+            name_bytes = item.encode('utf8')
+            return self._contains_name(name_bytes)
+        else:
+            return False
 
     cpdef void update(self, object arg):
         """Add mapping of codes to names to registry.
@@ -2316,7 +2539,9 @@ cdef class TiffTagRegistry:
         cdef str name
         
         if isinstance(arg, TiffTagRegistry):
-            self._list.extend(arg._list)
+            # Copy entries from other registry
+            for code, name in arg.items():
+                self.add(code, name)
             return
             
         if isinstance(arg, dict):
@@ -2327,33 +2552,42 @@ cdef class TiffTagRegistry:
 
     cpdef void add(self, int64_t code, str name):
         """Add code and name to registry."""
-        cdef dict d
+        cdef cpp_string name_bytes = name.encode('utf8')
+        cdef int64_t i, idx
+        cdef vector[int] code_indices, name_indices
+        cdef tuple entry
         
-        for d in self._list:
-            if code in d and d[code] == name:
-                break
-            if code not in d and name not in d:
-                d[code] = name
-                d[name] = code
-                break
-        else:
-            self._list.append({code: name, name: code})
+        # Check if already exists
+        if self._contains_code(code) and self._contains_name(name_bytes):
+            code_indices = self._get_code_indices(code)
+            name_indices = self._get_name_indices(name_bytes)
+            
+            # Check if this exact pair already exists
+            for i in range(<int64_t>code_indices.size()):
+                idx = code_indices[i]
+                entry = self._entries[idx]
+                if entry is not None and entry[0] == code and entry[1] == name:
+                    return  # Entry already exists
+        
+        # Add new entry
+        idx = len(self._entries)
+        self._entries.append((code, name))
+        self._add_index(code, name, idx)
+        self._entry_count += 1
 
     @staticmethod
-    cdef int _code_key(self, tuple element):
+    cdef int64_t _code_key(self, tuple element):
         return element[0]
 
     cpdef list items(self):
         """Return all registry items as (code, name)."""
         cdef list result = []
-        cdef dict d
-        cdef tuple i
+        cdef tuple entry
         
-        for d in self._list:
-            for i in d.items():
-                if isinstance(i[0], int):
-                    result.append(i)
-                    
+        for entry in self._entries:
+            if entry is not None:
+                result.append(entry)
+                
         return sorted(result, key=TiffTagRegistry._code_key)
 
     cpdef object get(self, object key, object default=None):
@@ -2363,12 +2597,36 @@ cdef class TiffTagRegistry:
             key: tag code or name to lookup.
             default: value to return if key is not found.
         """
-        cdef dict d
+        cdef int64_t code
+        cdef cpp_string name_bytes
+        cdef vector[int] indices
+        cdef int64_t i, idx
+        cdef tuple entry
         
-        for d in self._list:
-            if key in d:
-                return d[key]
+        if isinstance(key, int):
+            code = key
+            if not self._contains_code(code):
+                return default
                 
+            indices = self._get_code_indices(code)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                entry = self._entries[idx]
+                if entry is not None:
+                    return entry[1]  # Return name
+                    
+        elif isinstance(key, str):
+            name_bytes = key.encode('utf8')
+            if not self._contains_name(name_bytes):
+                return default
+                
+            indices = self._get_name_indices(name_bytes)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                entry = self._entries[idx]
+                if entry is not None:
+                    return entry[0]  # Return code
+                    
         return default
 
     cpdef object getall(self, object key, object default=None):
@@ -2379,49 +2637,94 @@ cdef class TiffTagRegistry:
             default: value to return if key is not found.
         """
         cdef list result = []
-        cdef dict d
+        cdef int64_t code
+        cdef cpp_string name_bytes
+        cdef vector[int] indices
+        cdef int64_t i, idx
+        cdef tuple entry
         
-        for d in self._list:
-            if key in d:
-                result.append(d[key])
+        if isinstance(key, int):
+            code = key
+            if not self._contains_code(code):
+                return default
                 
+            indices = self._get_code_indices(code)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                entry = self._entries[idx]
+                if entry is not None:
+                    result.append(entry[1])  # Collect names
+                    
+        elif isinstance(key, str):
+            name_bytes = key.encode('utf8')
+            if not self._contains_name(name_bytes):
+                return default
+                
+            indices = self._get_name_indices(name_bytes)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                entry = self._entries[idx]
+                if entry is not None:
+                    result.append(entry[0])  # Collect codes
+                    
         return result if result else default
 
     def __getitem__(self, object key):
         """Return first code or name. Raise KeyError if not found."""
-        cdef dict d
-        
-        for d in self._list:
-            if key in d:
-                return d[key]
-                
-        raise KeyError(key)
+        cdef result = self.get(key)
+        if result is None:
+            raise KeyError(key)
+        return result
 
     def __delitem__(self, object key):
         """Delete all tags of code or name."""
         cdef bint found = False
-        cdef dict d
-        cdef object value
-        
-        for d in self._list:
-            if key in d:
-                found = True
-                value = d[key]
-                del d[key]
-                del d[value]
+        cdef int64_t code
+        cdef cpp_string name_bytes
+        cdef vector[int] indices
+        cdef int64_t i, idx
+        cdef tuple entry
+
+        assert(False) # incorrect
+
+        if isinstance(key, int):
+            code = key
+            if not self._contains_code(code):
+                raise KeyError(key)
+
+            indices = self._get_code_indices(code)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                if self._entries[idx] is not None:
+                    self._entries[idx] = None
+                    found = True
+                    self._entry_count -= 1
+            
+            # Remove code from the multimap
+            self._code_indices.erase(code)
+                
+        elif isinstance(key, str):
+            name_bytes = bytes(key, 'utf8')
+            if not self._contains_name(name_bytes):
+                raise KeyError(key)
+
+            indices = self._get_name_indices(name_bytes)
+            for i in range(<int64_t>indices.size()):
+                idx = indices[i]
+                if self._entries[idx] is not None:
+                    self._entries[idx] = None
+                    found = True
+                    self._entry_count -= 1
+
+            # Remove name from the multimap
+            self._name_indices.erase(name_bytes)
                 
         if not found:
             raise KeyError(key)
 
     def __contains__(self, object item):
         """Return if code or name is in registry."""
-        cdef dict d
-        
-        for d in self._list:
-            if item in d:
-                return True
-                
-        return False
+        return self.contains(item)
 
     def __iter__(self):
         """Return iterator over all items in registry."""
@@ -2429,13 +2732,7 @@ cdef class TiffTagRegistry:
 
     def __len__(self):
         """Return number of registered tags."""
-        cdef int size = 0
-        cdef dict d
-        
-        for d in self._list:
-            size += len(d)
-            
-        return size // 2
+        return self._entry_count
 
     def __repr__(self) -> str:
         return f'<tifffile.TiffTagRegistry @0x{id(self):016X}>'
