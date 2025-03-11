@@ -90,3 +90,40 @@ cdef inline int64_t product(sequence):
     cdef int64_t r = 1
     for e in sequence:
         r *= int(e)
+
+cdef inline str bytes2str_stripnull(bytes b):
+    """Optimized version of byte2str(stripnull(b, first=False))."""
+    cdef int i = len(b)
+    cdef unsigned char* p = <unsigned char*>b
+    with nogil:
+        while i:
+            i -= 1
+            if p[i]:
+                break
+    if i == len(b) - 1:
+        return b.decode('utf-8')
+    return b[: i + 1].decode('utf-8')
+
+cdef inline str bytes2str_stripnull_last(bytes b):
+    """Optimized version of 
+    bytes2str(stripnull(b, first=False).strip()."""
+    cdef int size = len(b)
+    cdef unsigned char* p = <unsigned char*>b
+    cdef int i = 0
+    cdef int start, end
+    with nogil:
+        while i < size:
+            # omit 0 and whitespace
+            if p[i] or p[i] == 32:
+                break
+            i += 1
+        start = i
+        i = size
+        while i:
+            i -= 1
+            if p[i] or p[i] == 32:
+                break
+        end = i + 1
+    if start == 0 and end == size:
+        return b.decode('utf-8')
+    return b[start:end].decode('utf-8')

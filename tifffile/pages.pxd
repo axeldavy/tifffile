@@ -51,10 +51,26 @@ cdef class TiffPage:
     cdef public str description
     cdef public str description1
     cdef public float nodata
+
+    # Read IFD structure and tags
+    cdef void _read_ifd_structure(self)
+    cdef void _process_common_tags(self)
+    cdef void _process_special_format_tags(self)
+    cdef void _process_data_pointers(self)
+    cdef void _determine_shape_and_dtype(self)
+
+    # Read image data
+    cdef object _asarray_memmap(self)
+    cdef object _asarray_contiguous(self, out)
+    cdef object _asarray_ndpi_jpeg(self, out)
+    cdef object _asarray_tiled(self, out, int64_t maxworkers, int64_t buffersize)
     
     # Property declarations
     #cpdef TiffPage keyframe(self)
     #cpdef int index(self)
+    cpdef bint is_contiguous(self)
+    cpdef bint is_final(self)
+    cpdef bint is_memmappable(self)
     cpdef bint is_tiled(self)
     cpdef bint is_subsampled(self)
     cpdef bint is_jfif(self)

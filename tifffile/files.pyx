@@ -1,5 +1,5 @@
 #cython: language_level=3
-#cython: boundscheck=True
+#cython: boundscheck=False
 #cython: wraparound=True
 #cython: cdivision=True
 #cython: nonecheck=False
@@ -848,6 +848,9 @@ cdef class FileHandle:
                 tuples.
                 Else, return an iterator over a list of (segment, index)
                 tuples that were acquired in one pass.
+            closure:
+                if True, the segment is a closure that lazily evaluates
+                the data when called.
 
         Yields:
             Individual or lists of `(segment, index)` tuples.
@@ -893,7 +896,7 @@ cdef class FileHandle:
 
         result = []
 
-        if iscontig:
+        if iscontig and False:
             # consolidate reads
             i = 0
             while i < length:
@@ -933,24 +936,18 @@ cdef class FileHandle:
             return
 
         i = 0
-        cdef unique_lock[recursive_mutex] m
         while i < length:
             result = []
             size = 0
-            lock_gil_friendly(m, self._mutex)
             while size <= buffersize and i < length:
                 index, offset, bytecount = segments[i]
                 if offset > 0 and bytecount > 0:
-                    self.seek(offset)
-                    result.append((self.read(bytecount), index))
-                    # buffer = bytearray(bytecount)
-                    # n = fh.readinto(buffer)
-                    # data.append(buffer[:n])
+                    data = self.read_at(offset, bytecount)
+                    result.append((data, index))
                     size += bytecount
                 else:
                     result.append((None, index))
                 i += 1
-            m.unlock()
             if flat:
                 yield from result
             else:

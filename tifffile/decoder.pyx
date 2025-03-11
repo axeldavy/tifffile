@@ -1,5 +1,5 @@
 #cython: language_level=3
-#cython: boundscheck=True
+#cython: boundscheck=False
 #cython: wraparound=True
 #cython: cdivision=True
 #cython: nonecheck=False
@@ -418,7 +418,7 @@ cdef class TiffDecoder:
             self.depth = 1
         self.nodata = page.nodata
         
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         """Decode segment data.
         
         Parameters:
@@ -762,11 +762,12 @@ cdef class TiffDecoderJpeg(TiffDecoder):
         decoder.outcolorspace = outcolorspace
         return decoder
 
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef object jpegtables = kwargs.get('jpegtables', None)
         cdef object jpegheader = kwargs.get('jpegheader', None)
         cdef tuple segmentindex, shape
+        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -800,9 +801,10 @@ cdef class TiffDecoderEer(TiffDecoder):
         decoder.vertbits = vertbits
         return decoder
 
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
+        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -829,9 +831,10 @@ cdef class TiffDecoderJetraw(TiffDecoder):
         decoder.decompress = decompress
         return decoder
 
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
+        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -852,9 +855,10 @@ cdef class TiffDecoderImage(TiffDecoder):
         decoder.decompress = decompress
         return decoder
 
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
+        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -871,10 +875,11 @@ cdef class TiffDecoderImage(TiffDecoder):
 cdef class TiffDecoderBase(TiffDecoder):
     """Base class for other format decoders."""
     
-    def __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
         cdef int64_t size
+        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:

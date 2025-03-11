@@ -1,5 +1,6 @@
 #cython: language_level=3
 #cython: cdivision=True
+#cython: boundscheck=False
 #cython: nonecheck=False
 #cython: profile=True
 #distutils: language=c++
@@ -15,6 +16,7 @@ from .files cimport FileHandle
 from .format cimport TiffFormat, ByteOrder
 from .names cimport get_tag_names
 from .types cimport DATATYPE
+from .utils cimport bytes2str_stripnull, bytes2str_stripnull_last
 
 from .utils import pformat, stripnull, bytes2str, julian_datetime,\
     logger, astype, recarray2dict
@@ -811,7 +813,7 @@ cdef tuple read_uic_tag(
         size = read_int()
         if 0 <= size < 2**10:
             value = struct.unpack(f'{size}s', fh.read(size))[0][:-1]
-            value = bytes2str(stripnull(value))
+            value = bytes2str_stripnull(value)
         elif offset:
             value = ''
             logger().warning(
@@ -828,7 +830,7 @@ cdef tuple read_uic_tag(
             size = read_int()
             if 0 <= size < 2**10:
                 string = struct.unpack(f'{size}s', fh.read(size))[0][:-1]
-                string = bytes2str(stripnull(string))
+                string = bytes2str_stripnull(string)
                 value.append(string)
             elif offset:
                 logger().warning(
@@ -942,7 +944,7 @@ cdef dict read_sis(
     if magic != b'SIS0':
         raise ValueError('invalid OlympusSIS structure')
 
-    result['name'] = bytes2str(stripnull(name))
+    result['name'] = bytes2str_stripnull(name)
     try:
         result['datetime'] = DateTime(
             1900 + year, month + 1, day, hour, minute
@@ -963,8 +965,8 @@ cdef dict read_sis(
             result['pixelsizex'] = xcal * m
             result['pixelsizey'] = ycal * m
             result['magnification'] = mag
-            result['cameraname'] = bytes2str(stripnull(camname))
-            result['picturetype'] = bytes2str(stripnull(pictype))
+            result['cameraname'] = bytes2str_stripnull(camname)
+            result['picturetype'] = bytes2str_stripnull(pictype)
         elif tagtype == 10:
             # channel data
             continue
@@ -973,8 +975,8 @@ cdef dict read_sis(
             #  ) = struct.unpack('<h22sId4s32s48s32s', fh.read(152))  # 720
             # result['exposuretime'] = exptime
             # result['emvoltage'] = emv
-            # result['cameraname2'] = bytes2str(stripnull(camname))
-            # result['microscopename'] = bytes2str(stripnull(mictype))
+            # result['cameraname2'] = bytes2str_stripnull(camname)
+            # result['microscopename'] = bytes2str_stripnull(mictype)
 
     return result
 
@@ -1093,7 +1095,7 @@ cdef dict read_sis_ini(
     int64_t offsetsize,
 ):
     """Read OlympusSIS INI string from file."""
-    inistr = bytes2str(stripnull(fh.read(count)))
+    inistr = bytes2str_stripnull(fh.read(count))
     try:
         return olympusini_metadata(inistr)
     except Exception as exc:
@@ -1151,7 +1153,7 @@ cdef dict read_fei_metadata(
     """Read FEI SFEG/HELIOS headers from file."""
     result: dict[str, Any] = {}
     section: dict[str, Any] = {}
-    data = bytes2str(stripnull(fh.read(count)))
+    data = bytes2str_stripnull(fh.read(count))
     for line in data.splitlines():
         line = line.strip()
         if line.startswith('['):
@@ -1182,7 +1184,7 @@ cdef dict read_cz_sem(
     result: dict[str, Any] = {'': ()}
     value: Any
     key = None
-    data = bytes2str(stripnull(fh.read(count)))
+    data = bytes2str_stripnull(fh.read(count))
     for line in data.splitlines():
         if line.isupper():
             key = line.lower()
@@ -1271,7 +1273,6 @@ cdef object read_tag(int32_t tag,
         return read_tvips_header(fh, byteorder, dtype, count, offsetsize)  # TVIPS EMMENU
     elif tag == 43314:
         return read_nih_image_header(fh, byteorder, dtype, count, offsetsize)
-            # 40001: read_bytes,
     elif tag == 51123:
         return read_json(fh, byteorder, dtype, count, offsetsize)
     elif tag == 33471:
@@ -1286,7 +1287,7 @@ cdef object read_tag(int32_t tag,
         return read_interoperability_ifd(fh, byteorder, dtype, count, offsetsize)
     raise KeyError("Unknown tag code")
 
-cdef bint readable_tag(int32_t tag):
+cdef inline bint readable_tag(int32_t tag) noexcept nogil:
     """Tags supported by read_tag"""
     if (tag == 301
         or tag == 320
@@ -1324,7 +1325,7 @@ cdef bint readable_tag(int32_t tag):
         return True
     return False
 
-cdef bint no_delay_load(int32_t tag):
+cdef inline bint no_delay_load(int32_t tag) noexcept nogil:
     """tags whose values are not delay loaded"""
     if (tag == 258  # BitsPerSample
         or tag == 270  # ImageDescription
@@ -1353,7 +1354,7 @@ cdef bint no_delay_load(int32_t tag):
         return True
     return False
 
-cdef bint tag_is_tuple(int32_t tag):
+cdef inline bint tag_is_tuple(int32_t tag) noexcept nogil:
     if (tag == 273
         or tag == 279
         or tag == 282
@@ -1371,7 +1372,7 @@ cdef bint tag_is_tuple(int32_t tag):
         return True
     return False
 
-cdef int64_t get_data_format_size(int64_t datatype) nogil:
+cdef inline int64_t get_data_format_size(int64_t datatype) nogil:
     """Return size in bytes for the given TIFF DATATYPE.
     
     Parameters:
@@ -1632,7 +1633,7 @@ cdef class TiffTag:
         tag.code = code
         tag.datatype = datatype
         tag.count = count
-        tag.value = value
+        tag._value = value
         tag.valueoffset = valueoffset
         return tag
 
@@ -1736,9 +1737,7 @@ cdef class TiffTag:
             # TIFF ASCII fields can contain multiple strings,
             #   each terminated with a NUL
             try:
-                value = bytes2str(
-                    stripnull(<bytes>value, first=False).strip()
-                )
+                value = bytes2str_stripnull_last(value)
             except UnicodeDecodeError as exc:
                 logger().warning(
                     f'<tifffile.TiffTag {code} @{offset}> '
@@ -1746,7 +1745,7 @@ cdef class TiffTag:
                 )
             return value
 
-        if code in TIFF.TAG_ENUM:
+        if code in {254, 255, 259, 262, 266, 274, 284, 296, 317, 338, 339}:
             t = TIFF.TAG_ENUM[code]
             try:
                 value = tuple([t(v) for v in value])
@@ -1819,319 +1818,6 @@ cdef class TiffTag:
     def valuebytecount(self) -> int:
         """Number of bytes of tag value in file."""
         return self.count * struct.calcsize(TIFF.DATA_FORMATS[self.dtype])
-
-    def astuple(self):
-        """Return tag code, dtype, count, and encoded value.
-
-        The encoded value is read from file if necessary.
-
-        """
-        cdef object value = self.value_get()
-        cdef TiffFormat tiff
-        cdef int64_t count
-        cdef FileHandle fh
-        if not isinstance(value, bytes):
-            tiff = self.parent.tiff
-            dataformat = TIFF.DATA_FORMATS[self.datatype]
-            count = self.count * int(dataformat[0])
-            fmt = f'{tiff.byteorder}{count}{dataformat[1]}'
-            try:
-                if self.datatype == 2:
-                    # ASCII
-                    value = struct.pack(fmt, value.encode('ascii'))
-                    if len(value) != count:
-                        raise ValueError
-                elif count == 1 and not isinstance(value, tuple):
-                    value = struct.pack(fmt, value)
-                else:
-                    value = struct.pack(fmt, *value)
-            except Exception as exc:
-                if tiff.is_ndpi() and count == 1:
-                    raise ValueError(
-                        'cannot pack 64-bit NDPI value to 32-bit dtype'
-                    ) from exc
-                fh = self.parent.filehandle
-                pos = fh.tell()
-                fh.seek(self.valueoffset)
-                value = fh.read(struct.calcsize(fmt))
-                fh.seek(pos)
-        return self.code, int(self.datatype), self.count, value, True
-
-    def overwrite(
-        self,
-        filehandle,
-        value,
-        *,
-        dtype: DATATYPE | int | str | None = None,
-        erase: bool = True,
-    ) -> TiffTag:
-        """Write new tag value to file and return new TiffTag instance.
-
-        Warning: changing tag values in TIFF files might result in corrupted
-        files or have unexpected side effects.
-
-        The packed value is appended to the file if it is longer than the
-        old value. The file position is left where it was.
-
-        Overwriting tag values in NDPI files > 4 GB is only supported if
-        single integer values and new offsets do not exceed the 32-bit range.
-
-        Parameters:
-            value:
-                New tag value to write.
-                Must be compatible with the `struct.pack` formats corresponding
-                to the tag's data type.
-            dtype:
-                New tag data type. By default, the data type is not changed.
-            erase:
-                Overwrite previous tag values in file with zeros.
-
-        Raises:
-            struct.error:
-                Value is not compatible with dtype or new offset exceeds
-                TIFF size limit.
-            ValueError:
-                Invalid value or dtype, or old integer value in NDPI files
-                exceeds 32-bit range.
-
-        """
-        if self.offset < 8 or self.valueoffset < 8:
-            raise ValueError(f'cannot rewrite tag at offset {self.offset} < 8')
-
-        fh = filehandle
-        tiff = self.tiff_format
-        if tiff.is_ndpi():
-            # only support files < 4GB
-            if self.count == 1 and self.dtype in {4, 13}:
-                value = self.value_get()
-                if isinstance(value, tuple):
-                    v = value[0]
-                else:
-                    v = value
-                if v > 4294967295:
-                    raise ValueError('cannot patch NDPI > 4 GB files')
-            tiff = TIFF.CLASSIC_LE
-
-        if value is None:
-            value = b''
-        if dtype is None:
-            dtype = self.dtype
-        elif isinstance(dtype, str):
-            if len(dtype) > 1 and dtype[0] in '<>|=':
-                dtype = dtype[1:]
-            try:
-                dtype = TIFF.DATA_DTYPES[dtype]
-            except KeyError as exc:
-                raise ValueError(f'unknown data type {dtype!r}') from exc
-        else:
-            dtype = <DATATYPE>dtype#enumarg(DATATYPE, dtype)
-
-        packedvalue: bytes | None = None
-        dataformat: str
-        try:
-            dataformat = TIFF.DATA_FORMATS[dtype]
-        except KeyError as exc:
-            raise ValueError(f'unknown data type {dtype!r}') from exc
-
-        if dtype == 2:
-            # strings
-            if isinstance(value, str):
-                # enforce 7-bit ASCII on Unicode strings
-                try:
-                    value = value.encode('ascii')
-                except UnicodeEncodeError as exc:
-                    raise ValueError(
-                        'TIFF strings must be 7-bit ASCII'
-                    ) from exc
-            elif not isinstance(value, bytes):
-                raise ValueError('TIFF strings must be 7-bit ASCII')
-            if len(value) == 0 or value[-1:] != b'\x00':
-                value += b'\x00'
-            count = len(value)
-            value = (value,)
-
-        elif isinstance(value, bytes):
-            # pre-packed binary data
-            dtsize = struct.calcsize(dataformat)
-            if len(value) % dtsize:
-                raise ValueError('invalid packed binary data')
-            count = len(value) // dtsize
-            packedvalue = value
-            value = (value,)
-
-        else:
-            try:
-                count = len(value)
-            except TypeError:
-                value = (value,)
-                count = 1
-            if dtype in {5, 10}:
-                if count < 2 or count % 2:
-                    raise ValueError('invalid RATIONAL value')
-                count //= 2  # rational
-
-        if packedvalue is None:
-            packedvalue = struct.pack(
-                f'{tiff.byteorder}{count * int(dataformat[0])}{dataformat[1]}',
-                *value,
-            )
-        newsize = len(packedvalue)
-        oldsize = self.count * get_data_format_size(self.datatype)
-        valueoffset = self.valueoffset
-
-        pos = fh.tell()
-        try:
-            if dtype != self.dtype:
-                # rewrite data type
-                fh.seek(self.offset + 2)
-                fh.write(struct.pack(tiff.byteorder_str + 'H', dtype))
-
-            if oldsize <= tiff.tagoffsetthreshold:
-                if newsize <= tiff.tagoffsetthreshold:
-                    # inline -> inline: overwrite
-                    fh.seek(self.offset + 4)
-                    fh.write(struct.pack(tiff.tagformat2, count, packedvalue))
-                else:
-                    # inline -> separate: append to file
-                    fh.seek(0, os.SEEK_END)
-                    valueoffset = fh.tell()
-                    if valueoffset % 2:
-                        # value offset must begin on a word boundary
-                        fh.write(b'\x00')
-                        valueoffset += 1
-                    # write new offset
-                    fh.seek(self.offset + 4)
-                    fh.write(
-                        struct.pack(
-                            tiff.tagformat2,
-                            count,
-                            struct.pack(tiff.offsetformat, valueoffset),
-                        )
-                    )
-                    # write new value
-                    fh.seek(valueoffset)
-                    fh.write(packedvalue)
-
-            elif newsize <= tiff.tagoffsetthreshold:
-                # separate -> inline: erase old value
-                valueoffset = (
-                    self.offset + 4 + struct.calcsize(tiff.tagformat2[:2])
-                )
-                fh.seek(self.offset + 4)
-                fh.write(struct.pack(tiff.tagformat2, count, packedvalue))
-                if erase:
-                    fh.seek(self.valueoffset)
-                    fh.write(b'\x00' * oldsize)
-            elif newsize <= oldsize or self.valueoffset + oldsize == fh.size:
-                # separate -> separate smaller: overwrite, erase remaining
-                fh.seek(self.offset + 4)
-                fh.write(struct.pack(tiff.tagformat2[:2], count))
-                fh.seek(self.valueoffset)
-                fh.write(packedvalue)
-                if erase and oldsize - newsize > 0:
-                    fh.write(b'\x00' * (oldsize - newsize))
-            else:
-                # separate -> separate larger: erase old value, append to file
-                fh.seek(0, os.SEEK_END)
-                valueoffset = fh.tell()
-                if valueoffset % 2:
-                    # value offset must begin on a word boundary
-                    fh.write(b'\x00')
-                    valueoffset += 1
-                # write offset
-                fh.seek(self.offset + 4)
-                fh.write(
-                    struct.pack(
-                        tiff.tagformat2,
-                        count,
-                        struct.pack(tiff.offsetformat, valueoffset),
-                    )
-                )
-                # write value
-                fh.seek(valueoffset)
-                fh.write(packedvalue)
-                if erase:
-                    fh.seek(self.valueoffset)
-                    fh.write(b'\x00' * oldsize)
-
-        finally:
-            fh.seek(pos)  # must restore file position
-
-        return TiffTag(
-            self.parent,
-            self.offset,
-            self.code,
-            dtype,
-            count,
-            value,
-            valueoffset,
-        )
-
-    def _fix_lsm_bitspersample(self) -> None:
-        """Correct LSM bitspersample tag.
-
-        Old LSM writers may use a separate region for two 16-bit values,
-        although they fit into the tag value element of the tag.
-
-        """
-        if self.code != 258 or self.count != 2:
-            return
-        # TODO: test this case; need example file
-        logger().warning(f'{self!r} correcting LSM bitspersample tag')
-        value = struct.pack('<HH', *self.value)
-        self.valueoffset = struct.unpack('<I', value)[0]
-        self.parent.filehandle.seek(self.valueoffset)
-        self.value = struct.unpack('<HH', self.parent.filehandle.read(4))
-
-    def __repr__(self) -> str:
-        name = '|'.join(TIFF.TAGS.getall(self.code, []))
-        if name:
-            name = ' ' + name
-        return f'<tifffile.TiffTag {self.code}{name} @{self.offset}>'
-
-    def __str__(self) -> str:
-        return self._str()
-
-    def _str(self, detail: int = 0, width: int = 79) -> str:
-        """Return string containing information about TiffTag."""
-        height = 1 if detail <= 0 else 8 * detail
-        dtype = self.dtype_name
-        if self.count > 1:
-            dtype += f'[{self.count}]'
-        name = '|'.join(TIFF.TAGS.getall(self.code, []))
-        if name:
-            name = f'{self.code} {name} @{self.offset}'
-        else:
-            name = f'{self.code} @{self.offset}'
-        line = f'TiffTag {name} {dtype} @{self.valueoffset} '
-        line = line[:width]
-        try:
-            value = self.value
-        except TiffFileError:
-            value = 'CORRUPTED'
-        else:
-            try:
-                if self.count == 1:
-                    value = str(value) # TODO enumstr
-                else:
-                    value = pformat(tuple(str(v) for v in value))
-            except Exception:
-                if not isinstance(value, (tuple, list)):
-                    pass
-                elif height == 1:
-                    value = value[:256]
-                elif len(value) > 2048:
-                    value = (
-                        value[:1024] + value[-1024:]  # type: ignore[operator]
-                    )
-                value = pformat(value, width=width, height=height)
-        if detail <= 0:
-            line += '= '
-            line += value[:width]
-            line = line[:width]
-        else:
-            line += '\n' + value
-        return line
 
 @cython.final
 cdef class TiffTags:
@@ -2374,7 +2060,8 @@ cdef class TiffTags:
 
     def __contains__(self, object item):
         """Return if tag is in map."""
-        return self.contains(item)
+        print(item, self.contains_code(item))
+        return self.contains_code(item)
 
     def __iter__(self):
         """Return iterator over all tags."""
@@ -2386,49 +2073,6 @@ cdef class TiffTags:
         """Return number of tags."""
         return self._tag_count
 
-    def __repr__(self) -> str:
-        return f'<tifffile.TiffTags @0x{id(self):016X}>'
-
-    def __str__(self) -> str:
-        return self._str()
-
-    def _str(self, detail: int = 0, width: int = 79) -> str:
-        """Return string with information about TiffTags."""
-        cdef list info = []
-        cdef list tlines = []
-        cdef list vlines = []
-        cdef TiffTag tag
-        cdef str value
-        cdef object tag_value
-
-        for tag in self:
-            value = tag._str(width=width + 1)
-            tlines.append(value[:width].strip())
-            if detail > 0 and len(value) > width:
-                try:
-                    value = tag.value
-                except Exception:
-                    # delay load failed or closed file
-                    continue
-                if tag.code in {273, 279, 324, 325}:
-                    if detail < 1:
-                        value = value[:256]
-                    elif len(value) > 1024:
-                        value = value[:512] + value[-512:]
-                    value = pformat(value, width=width, height=detail * 3)
-                else:
-                    value = pformat(value, width=width, height=detail * 8)
-                if tag.count > 1:
-                    vlines.append(
-                        f'{tag.name} {tag.dtype_name}[{tag.count}]\n{value}'
-                    )
-                else:
-                    vlines.append(f'{tag.name}\n{value}')
-        info.append('\n'.join(tlines))
-        if detail > 0 and vlines:
-            info.append('\n')
-            info.append('\n\n'.join(vlines))
-        return '\n'.join(info)
 
 @cython.final
 cdef class TiffTagRegistry:
@@ -2733,11 +2377,3 @@ cdef class TiffTagRegistry:
     def __len__(self):
         """Return number of registered tags."""
         return self._entry_count
-
-    def __repr__(self) -> str:
-        return f'<tifffile.TiffTagRegistry @0x{id(self):016X}>'
-
-    def __str__(self) -> str:
-        return 'TiffTagRegistry(((\n  {}\n))'.format(
-            ',\n  '.join(f'({code}, {name!r})' for code, name in self.items())
-        )
