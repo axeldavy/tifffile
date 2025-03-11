@@ -395,6 +395,28 @@ cdef class TiffDecoder:
     
     def __init__(self, TiffPage page):
         self.page = page
+        # Initialize shape parameters
+        if page.is_tiled():
+            self.is_tiled = True
+            self.stdepth = page.tiledepth
+            self.stlength = page.tilelength
+            self.stwidth = page.tilewidth
+            _, self.imdepth, self.imlength, self.imwidth, _ = page.shaped
+            self.samples = page.samplesperpixel if page.planarconfig == 1 else 1
+            self.width = (self.imwidth + self.stwidth - 1) // self.stwidth
+            self.length = (self.imlength + self.stlength - 1) // self.stlength
+            self.depth = (self.imdepth + self.stdepth - 1) // self.stdepth
+        else:
+            self.is_tiled = False
+            self.stdepth = 1
+            self.stlength = page.rowsperstrip
+            self.stwidth = page.imagewidth
+            _, self.imdepth, self.imlength, self.imwidth, _ = page.shaped
+            self.samples = page.samplesperpixel if page.planarconfig == 1 else 1
+            self.length = (self.imlength + self.stlength - 1) // self.stlength
+            self.width = 1
+            self.depth = 1
+        self.nodata = page.nodata
         
     def __call__(self, object data, int64_t index, **kwargs):
         """Decode segment data.
@@ -408,6 +430,129 @@ cdef class TiffDecoder:
             tuple: (decoded_data, segment_indices, segment_shape)
         """
         raise NotImplementedError("Subclass must implement __call__")
+    
+    cdef tuple get_indices_shape(self, int64_t segmentindex):
+        """Get indices and shape for a segment."""
+        cdef tuple indices
+        cdef tuple shape
+        
+        if self.is_tiled:
+            # Tile indices
+            indices = (
+                segmentindex // (self.width * self.length * self.depth),
+                (segmentindex // (self.width * self.length)) % self.depth * self.stdepth,
+                (segmentindex // self.width) % self.length * self.stlength,
+                segmentindex % self.width * self.stwidth,
+                0,
+            )
+            shape = (self.stdepth, self.stlength, self.stwidth, self.samples)
+        else:
+            # Strip indices
+            indices = (
+                segmentindex // (self.length * self.imdepth),
+                (segmentindex // self.length) % self.imdepth * self.stdepth,
+                segmentindex % self.length * self.stlength,
+                0,
+                0,
+            )
+            shape = (
+                self.stdepth,
+                min(self.stlength, self.stlength - indices[2] % self.stlength),
+                self.stwidth,
+                self.samples,
+            )
+        return indices, shape
+    
+    cdef object reshape_data(self, object data, tuple indices, tuple shape):
+        """Reshape data array according to indices and shape."""
+        cdef int64_t size = shape[0] * shape[1] * shape[2] * shape[3]
+        
+        if self.is_tiled:
+            # Reshape tile data
+            if data.ndim == 1 and data.size > size:
+                data = data[:size]
+            if data.size == size:
+                return data.reshape(shape)
+            try:
+                return data.reshape(
+                    (
+                        min(self.imdepth - indices[1], shape[0]),
+                        min(self.imlength - indices[2], shape[1]),
+                        min(self.imwidth - indices[3], shape[2]),
+                        self.samples,
+                    )
+                )
+            except ValueError:
+                pass
+            try:
+                return data.reshape(
+                    (
+                        min(self.imdepth - indices[1], shape[0]),
+                        min(self.imlength - indices[2], shape[1]),
+                        shape[2],
+                        self.samples,
+                    )
+                )
+            except ValueError:
+                pass
+            raise TiffFileError(
+                f'corrupted tile @ {indices} cannot be reshaped from '
+                f'{data.shape} to {shape}'
+            )
+        else:
+            # Reshape strip data
+            if data.ndim == 1 and data.size > size:
+                data = data[:size]
+            if data.size == size:
+                try:
+                    data.shape = shape
+                except AttributeError:
+                    data = data.reshape(shape)
+                return data
+            datashape = data.shape
+            try:
+                data.shape = shape[0], -1, shape[2], shape[3]
+                data = data[:, : shape[1]]
+                data.shape = shape
+                return data
+            except ValueError:
+                pass
+            raise TiffFileError(
+                'corrupted strip cannot be reshaped from '
+                f'{datashape} to {shape}'
+            )
+    
+    cdef tuple pad_data(self, object data, tuple shape):
+        """Pad data to match the expected shape."""
+        cdef list padwidth
+        
+        if self.is_tiled:
+            # Pad tile data
+            if data.shape == shape:
+                return data, shape
+            padwidth = [(0, i - j) for i, j in zip(shape, data.shape)]
+            data = numpy.pad(data, padwidth, constant_values=self.nodata)
+            return data, shape
+        else:
+            # Pad strip data
+            shape = (shape[0], self.stlength, shape[2], shape[3])
+            if data.shape == shape:
+                return data, shape
+            padwidth = [
+                (0, 0),
+                (0, self.stlength - data.shape[1]),
+                (0, 0),
+                (0, 0),
+            ]
+            data = numpy.pad(data, padwidth, constant_values=self.nodata)
+            return data, shape
+    
+    cdef tuple pad_none(self, tuple shape):
+        """Return the full shape for empty segments."""
+        if self.is_tiled:
+            return shape
+        else:
+            return (shape[0], self.stlength, shape[2], shape[3])
 
     @staticmethod
     cdef TiffDecoder create(TiffPage page):
@@ -422,12 +567,9 @@ cdef class TiffDecoder:
         Raises:
             ValueError: If decoding is not supported.
         """
-        cdef int64_t stdepth, stlength, stwidth, samples, imdepth, imlength, imwidth
-        cdef int64_t width, length, depth
-        
         # Check common error conditions first
         if page.dtype is None or page._dtype is None:
-            return TiffDecoderError(
+            return TiffDecoderError.initialize(
                 page, 
                 'data type not supported '
                 f'(SampleFormat {page.sampleformat}, '
@@ -435,7 +577,7 @@ cdef class TiffDecoder:
             )
 
         if 0 in tuple(page.shaped):
-            return TiffDecoderError(page, 'empty image')
+            return TiffDecoderError.initialize(page, 'empty image')
 
         # Get decompressor function
         try:
@@ -449,7 +591,7 @@ cdef class TiffDecoder:
             ):
                 raise KeyError(page.compression)
         except KeyError as exc:
-            return TiffDecoderError(page, str(exc)[1:-1])
+            return TiffDecoderError.initialize(page, str(exc)[1:-1])
 
         # Get unpredictor function
         try:
@@ -464,13 +606,13 @@ cdef class TiffDecoder:
                 )
                 unpredict = None
             else:
-                return TiffDecoderError(page, str(exc)[1:-1])
+                return TiffDecoderError.initialize(page, str(exc)[1:-1])
 
         # Check if sample formats match
         if page.tags.get(339) is not None:
             tag = page.tags[339]  # SampleFormat
             if tag.count != 1 and any(i - tag.value[0] for i in tag.value_get()):
-                return TiffDecoderError(
+                return TiffDecoderError.initialize(
                     page, f'sample formats do not match {tag.value}'
                 )
 
@@ -479,7 +621,7 @@ cdef class TiffDecoder:
             page.compression not in {6, 7, 34892, 33007}
             or page.planarconfig == 2
         ):
-            return TiffDecoderError(
+            return TiffDecoderError.initialize(
                 page, 'chroma subsampling not supported without JPEG compression'
             )
 
@@ -489,50 +631,6 @@ cdef class TiffDecoder:
             def decompress_webp_rgba(data, out=None):
                 return imagecodecs.webp_decode(data, hasalpha=True, out=out)
             decompress = decompress_webp_rgba
-
-        # Normalize segments shape to [depth, length, width, contig]
-        if page.is_tiled():
-            stshape = (
-                page.tiledepth,
-                page.tilelength,
-                page.tilewidth,
-                page.samplesperpixel if page.planarconfig == 1 else 1,
-            )
-        else:
-            stshape = (
-                1,
-                page.rowsperstrip,
-                page.imagewidth,
-                page.samplesperpixel if page.planarconfig == 1 else 1,
-            )
-
-        stdepth, stlength, stwidth, samples = stshape
-        _, imdepth, imlength, imwidth, _ = page.shaped
-
-        # Create helper functions based on tiled or strip mode
-        if page.is_tiled():
-            width = (imwidth + stwidth - 1) // stwidth
-            length = (imlength + stlength - 1) // stlength
-            depth = (imdepth + stdepth - 1) // stdepth
-            
-            indices_func = create_tile_indices_func(
-                width, length, depth, stdepth, stlength, stwidth, samples
-            )
-            reshape_func = create_reshape_tile_func(
-                imdepth, imlength, imwidth, samples
-            )
-            pad_func = create_pad_tile_func(page.nodata)
-            pad_none_func = create_pad_none_tile_func()
-        else:
-            # strips
-            length = (imlength + stlength - 1) // stlength
-            
-            indices_func = create_strip_indices_func(
-                length, imdepth, stdepth, stlength, stwidth, samples
-            )
-            reshape_func = create_reshape_strip_func()
-            pad_func = create_pad_strip_func(stlength, page.nodata)
-            pad_none_func = create_pad_none_strip_func(stlength)
 
         # Select appropriate decoder based on compression
         if page.compression in {6, 7, 34892, 33007}:
@@ -546,10 +644,12 @@ cdef class TiffDecoder:
                     f'{page!r} SonyRawFileType might need additional '
                     'unpacking (see issue #95)'
                 )
-                
-            return TiffDecoderJpeg(
-                page, indices_func, reshape_func, pad_func, pad_none_func
+            
+            colorspace, outcolorspace = jpeg_decode_colorspace(
+                page.photometric, page.planarconfig, page.extrasamples, page.is_jfif()
             )
+            
+            return TiffDecoderJpeg.initialize(page, colorspace, outcolorspace)
                 
         elif page.compression in {65000, 65001, 65002}:
             # EER decoder requires shape and extra args
@@ -566,16 +666,11 @@ cdef class TiffDecoder:
                 horzbits = 2
                 vertbits = 2
                 
-            return TiffDecoderEer(
-                page, decompress, rlebits, horzbits, vertbits, 
-                indices_func, pad_none_func
-            )
+            return TiffDecoderEer.initialize(page, decompress, rlebits, horzbits, vertbits)
                 
         elif page.compression == 48124:
             # Jetraw requires pre-allocated output buffer
-            return TiffDecoderJetraw(
-                page, decompress, indices_func, pad_none_func
-            )
+            return TiffDecoderJetraw.initialize(page, decompress)
                 
         elif page.compression in TIFF.IMAGE_COMPRESSIONS:
             # presume codecs always return correct dtype, native byte order...
@@ -590,14 +685,13 @@ cdef class TiffDecoder:
                     f'disabling predictor for compression {page.compression}'
                 )
                 
-            return TiffDecoderImage(
-                page, decompress, indices_func, reshape_func, pad_func, pad_none_func
-            )
+            return TiffDecoderImage.initialize(page, decompress)
                 
         else:
             # Regular data types
-            dtype = numpy.dtype(page.parent.byteorder + page._dtype.char)
-
+            dtype = numpy.dtype(page.tiff.byteorder_str + page._dtype.char)
+            decoder = None
+            
             if page.sampleformat == 5:
                 # complex integer
                 if unpredict is not None:
@@ -606,100 +700,78 @@ cdef class TiffDecoder:
                     )
 
                 itype = numpy.dtype(
-                    f'{page.parent.byteorder}i{page.bitspersample // 16}'
+                    f'{page.tiff.byteorder_str}i{page.bitspersample // 16}'
                 )
                 ftype = numpy.dtype(
-                    f'{page.parent.byteorder}f{dtype.itemsize // 2}'
+                    f'{page.tiff.byteorder_str}f{dtype.itemsize // 2}'
                 )
-
-                def unpack(data):
-                    # return complex integer as numpy.complex
-                    return numpy.frombuffer(data, itype).astype(ftype).view(dtype)
-
+                
+                return TiffDecoderComplexInt.initialize(page, decompress, unpredict, page.fillorder, dtype, itype, ftype)
+                
             elif page.bitspersample in {8, 16, 32, 64, 128}:
                 # regular data types
-                if (page.bitspersample * stwidth * samples) % 8:
+                if (page.bitspersample * page.imagewidth * page.samplesperpixel) % 8:
                     raise ValueError('data and sample size mismatch')
                 if page.predictor in {3, 34894, 34895}:  # PREDICTOR.FLOATINGPOINT
                     # floating-point horizontal differencing decoder needs
                     # raw byte order
                     dtype = numpy.dtype(page._dtype.char)
-
-                def unpack(data):
-                    # return numpy array from buffer
-                    try:
-                        # read only numpy array
-                        return numpy.frombuffer(data, dtype)
-                    except ValueError:
-                        # for example, LZW strips may be missing EOI
-                        bps = page.bitspersample // 8
-                        size = (len(data) // bps) * bps
-                        return numpy.frombuffer(data[:size], dtype)
+                    
+                return TiffDecoderRegular.initialize(page, decompress, unpredict, page.fillorder, dtype)
 
             elif isinstance(page.bitspersample, tuple):
                 # for example, RGB 565
-                def unpack(data):
-                    # return numpy array from packed integers
-                    return unpack_rgb(data, dtype, page.bitspersample)
+                return TiffDecoderRGB.initialize(page, decompress, unpredict, page.fillorder, dtype, page.bitspersample)
 
             elif page.bitspersample == 24 and dtype.char == 'f':
                 # float24
                 if unpredict is not None:
                     # floatpred_decode requires numpy.float24, which does not exist
                     raise NotImplementedError('unpredicting float24 not supported')
-
-                def unpack(data):
-                    # return numpy.float32 array from float24
-                    return imagecodecs.float24_decode(
-                        data, byteorder=page.parent.byteorder
-                    )
+                    
+                return TiffDecoderFloat24.initialize(page, decompress, unpredict, page.fillorder, dtype)
 
             else:
                 # bilevel and packed integers
-                def unpack(data):
-                    # return NumPy array from packed integers
-                    return imagecodecs.packints_decode(
-                        data, dtype, page.bitspersample, runlen=stwidth * samples
-                    )
-                    
-            return TiffDecoderOther(
-                page, decompress, unpack, unpredict, page.fillorder, dtype,
-                indices_func, reshape_func, pad_func, pad_none_func
-            )
+                return TiffDecoderPackedBits.initialize(
+                    page, 
+                    decompress, 
+                    unpredict, 
+                    page.fillorder, 
+                    dtype, 
+                    page.bitspersample, 
+                    page.imagewidth * page.samplesperpixel
+                )
 
 cdef class TiffDecoderError(TiffDecoder):
     """Decoder that raises an error."""
     
-    def __init__(self, TiffPage page, str error_message):
-        super().__init__(page)
-        self.error_message = error_message
-        
-    def __call__(self, object data, int64_t index, **kwargs):
-        raise ValueError(self.error_message)
+    @staticmethod
+    cdef TiffDecoderError initialize(TiffPage page, str error_message):
+        cdef TiffDecoderError decoder = TiffDecoderError(page)
+        decoder.error_message = error_message
+        return decoder
 
 cdef class TiffDecoderJpeg(TiffDecoder):
     """Decoder for JPEG compressed segments."""
     
-    def __init__(self, TiffPage page, object indices_func, object reshape_func, 
-                 object pad_func, object pad_none_func):
-        super().__init__(page)
-        self.colorspace, self.outcolorspace = jpeg_decode_colorspace(
-            page.photometric, page.planarconfig, page.extrasamples, page.is_jfif()
-        )
-        self.indices_func = indices_func
-        self.reshape_func = reshape_func
-        self.pad_func = pad_func
-        self.pad_none_func = pad_none_func
-        
+    @staticmethod
+    cdef TiffDecoderJpeg initialize(TiffPage page, object colorspace, object outcolorspace):
+        cdef TiffDecoderJpeg decoder = TiffDecoderJpeg(page)
+        decoder.colorspace = colorspace
+        decoder.outcolorspace = outcolorspace
+        return decoder
+
     def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef object jpegtables = kwargs.get('jpegtables', None)
         cdef object jpegheader = kwargs.get('jpegheader', None)
+        cdef tuple segmentindex, shape
         
-        segmentindex, shape = self.indices_func(index)
+        segmentindex, shape = self.get_indices_shape(index)
         if data is None:
             if _fullsize:
-                shape = self.pad_none_func(shape)
+                shape = self.pad_none(shape)
             return data, segmentindex, shape
             
         data_array = imagecodecs.jpeg_decode(
@@ -711,32 +783,31 @@ cdef class TiffDecoderJpeg(TiffDecoder):
             outcolorspace=self.outcolorspace,
             shape=shape[1:3]
         )
-        data_array = self.reshape_func(data_array, segmentindex, shape)
+        data_array = self.reshape_data(data_array, segmentindex, shape)
         if _fullsize:
-            data_array, shape = self.pad_func(data_array, shape)
+            data_array, shape = self.pad_data(data_array, shape)
         return data_array, segmentindex, shape
 
 cdef class TiffDecoderEer(TiffDecoder):
     """Decoder for EER compressed segments."""
     
-    def __init__(self, TiffPage page, object decompress, int64_t rlebits, 
-                 int64_t horzbits, int64_t vertbits, object indices_func, 
-                 object pad_none_func):
-        super().__init__(page)
-        self.decompress = decompress
-        self.rlebits = rlebits
-        self.horzbits = horzbits
-        self.vertbits = vertbits
-        self.indices_func = indices_func
-        self.pad_none_func = pad_none_func
-        
+    @staticmethod
+    cdef TiffDecoderEer initialize(TiffPage page, object decompress, int64_t rlebits, int64_t horzbits, int64_t vertbits):
+        cdef TiffDecoderEer decoder = TiffDecoderEer(page)
+        decoder.decompress = decompress
+        decoder.rlebits = rlebits
+        decoder.horzbits = horzbits
+        decoder.vertbits = vertbits
+        return decoder
+
     def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
+        cdef tuple segmentindex, shape
         
-        segmentindex, shape = self.indices_func(index)
+        segmentindex, shape = self.get_indices_shape(index)
         if data is None:
             if _fullsize:
-                shape = self.pad_none_func(shape)
+                shape = self.pad_none(shape)
             return data, segmentindex, shape
             
         data_array = self.decompress(
@@ -752,78 +823,63 @@ cdef class TiffDecoderEer(TiffDecoder):
 cdef class TiffDecoderJetraw(TiffDecoder):
     """Decoder for Jetraw compressed segments."""
     
-    def __init__(self, TiffPage page, object decompress, object indices_func, 
-                 object pad_none_func):
-        super().__init__(page)
-        self.decompress = decompress
-        self.indices_func = indices_func
-        self.pad_none_func = pad_none_func
-        
+    @staticmethod
+    cdef TiffDecoderJetraw initialize(TiffPage page, object decompress):
+        cdef TiffDecoderJetraw decoder = TiffDecoderJetraw(page)
+        decoder.decompress = decompress
+        return decoder
+
     def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
+        cdef tuple segmentindex, shape
         
-        segmentindex, shape = self.indices_func(index)
+        segmentindex, shape = self.get_indices_shape(index)
         if data is None:
             if _fullsize:
-                shape = self.pad_none_func(shape)
+                shape = self.pad_none(shape)
             return data, segmentindex, shape
             
         data_array = numpy.zeros(shape, numpy.uint16)
         self.decompress(data, out=data_array)
-        return data_array.reshape(shape), segmentindex, shape
+        return data_array, segmentindex, shape
 
 cdef class TiffDecoderImage(TiffDecoder):
     """Decoder for image compressions."""
     
-    def __init__(self, TiffPage page, object decompress, object indices_func, 
-                 object reshape_func, object pad_func, object pad_none_func):
-        super().__init__(page)
-        self.decompress = decompress
-        self.indices_func = indices_func
-        self.reshape_func = reshape_func
-        self.pad_func = pad_func
-        self.pad_none_func = pad_none_func
-        
+    @staticmethod
+    cdef TiffDecoderImage initialize(TiffPage page, object decompress):
+        cdef TiffDecoderImage decoder = TiffDecoderImage(page)
+        decoder.decompress = decompress
+        return decoder
+
     def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
+        cdef tuple segmentindex, shape
         
-        segmentindex, shape = self.indices_func(index)
+        segmentindex, shape = self.get_indices_shape(index)
         if data is None:
             if _fullsize:
-                shape = self.pad_none_func(shape)
+                shape = self.pad_none(shape)
             return data, segmentindex, shape
             
         data_array = self.decompress(data)
-        data_array = self.reshape_func(data_array, segmentindex, shape)
+        data_array = self.reshape_data(data_array, segmentindex, shape)
         if _fullsize:
-            data_array, shape = self.pad_func(data_array, shape)
+            data_array, shape = self.pad_data(data_array, shape)
         return data_array, segmentindex, shape
 
-cdef class TiffDecoderOther(TiffDecoder):
-    """Decoder for other formats."""
+cdef class TiffDecoderBase(TiffDecoder):
+    """Base class for other format decoders."""
     
-    def __init__(self, TiffPage page, object decompress, object unpack, 
-                 object unpredict, int64_t fillorder, object dtype,
-                 object indices_func, object reshape_func, object pad_func, 
-                 object pad_none_func):
-        super().__init__(page)
-        self.decompress = decompress
-        self.unpack = unpack
-        self.unpredict = unpredict
-        self.fillorder = fillorder
-        self.dtype = dtype
-        self.indices_func = indices_func
-        self.reshape_func = reshape_func
-        self.pad_func = pad_func
-        self.pad_none_func = pad_none_func
-        
     def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
+        cdef tuple segmentindex, shape
+        cdef int64_t size
         
-        segmentindex, shape = self.indices_func(index)
+        segmentindex, shape = self.get_indices_shape(index)
         if data is None:
             if _fullsize:
-                shape = self.pad_none_func(shape)
+                shape = self.pad_none(shape)
             return data, segmentindex, shape
             
         if self.fillorder == 2:
@@ -833,145 +889,110 @@ cdef class TiffDecoderOther(TiffDecoder):
             data = self.decompress(data, out=size * self.dtype.itemsize)
             
         data_array = self.unpack(data)
-        data_array = self.reshape_func(data_array, segmentindex, shape)
+        data_array = self.reshape_data(data_array, segmentindex, shape)
         data_array = data_array.astype('=' + self.dtype.char, copy=False)
         if self.unpredict is not None:
             data_array = self.unpredict(data_array, axis=-2, out=data_array)
         if _fullsize:
-            data_array, shape = self.pad_func(data_array, shape)
+            data_array, shape = self.pad_data(data_array, shape)
         return data_array, segmentindex, shape
+    
+    cdef object unpack(self, object data):
+        """Unpack data."""
+        raise NotImplementedError("Subclass must implement unpack")
 
-# Helper functions for creating index and shape handling functions
-def create_tile_indices_func(width, length, depth, stdepth, stlength, stwidth, samples):
-    """Create function to return indices and shape of tile."""
-    def indices_func(segmentindex):
-        return (
-            (
-                segmentindex // (width * length * depth),
-                (segmentindex // (width * length)) % depth * stdepth,
-                (segmentindex // width) % length * stlength,
-                segmentindex % width * stwidth,
-                0,
-            ),
-            (stdepth, stlength, stwidth, samples),
-        )
-    return indices_func
+cdef class TiffDecoderComplexInt(TiffDecoderBase):
+    """Decoder for complex integers."""
+    
+    @staticmethod
+    cdef TiffDecoderComplexInt initialize(TiffPage page, object decompress, object unpredict, int64_t fillorder, object dtype, object itype, object ftype):
+        cdef TiffDecoderComplexInt decoder = TiffDecoderComplexInt(page)
+        decoder.decompress = decompress
+        decoder.unpredict = unpredict
+        decoder.fillorder = fillorder
+        decoder.dtype = dtype
+        decoder.itype = itype
+        decoder.ftype = ftype
+        return decoder
+        
+    cdef object unpack(self, object data):
+        """Return complex integer as numpy.complex."""
+        return numpy.frombuffer(data, self.itype).astype(self.ftype).view(self.dtype)
 
-def create_strip_indices_func(length, imdepth, stdepth, stlength, stwidth, samples):
-    """Create function to return indices and shape of strip."""
-    def indices_func(segmentindex):
-        indices = (
-            segmentindex // (length * imdepth),
-            (segmentindex // length) % imdepth * stdepth,
-            segmentindex % length * stlength,
-            0,
-            0,
-        )
-        shape = (
-            stdepth,
-            min(stlength, stlength - indices[2] % stlength),
-            stwidth,
-            samples,
-        )
-        return indices, shape
-    return indices_func
+cdef class TiffDecoderRegular(TiffDecoderBase):
+    """Decoder for regular data types."""
+    
+    @staticmethod
+    cdef TiffDecoderRegular initialize(TiffPage page, object decompress, object unpredict, int64_t fillorder, object dtype):
+        cdef TiffDecoderRegular decoder = TiffDecoderRegular(page)
+        decoder.decompress = decompress
+        decoder.unpredict = unpredict
+        decoder.fillorder = fillorder
+        decoder.dtype = dtype
+        return decoder
 
-def create_reshape_tile_func(imdepth, imlength, imwidth, samples):
-    """Create function to reshape tile data."""
-    def reshape_func(data, indices, shape):
-        size = shape[0] * shape[1] * shape[2] * shape[3]
-        if data.ndim == 1 and data.size > size:
-            data = data[:size]
-        if data.size == size:
-            return data.reshape(shape)
+    cdef object unpack(self, object data):
+        """Return numpy array from buffer."""
         try:
-            return data.reshape(
-                (
-                    min(imdepth - indices[1], shape[0]),
-                    min(imlength - indices[2], shape[1]),
-                    min(imwidth - indices[3], shape[2]),
-                    samples,
-                )
-            )
+            # read only numpy array
+            return numpy.frombuffer(data, self.dtype)
         except ValueError:
-            pass
-        try:
-            return data.reshape(
-                (
-                    min(imdepth - indices[1], shape[0]),
-                    min(imlength - indices[2], shape[1]),
-                    shape[2],
-                    samples,
-                )
-            )
-        except ValueError:
-            pass
-        raise TiffFileError(
-            f'corrupted tile @ {indices} cannot be reshaped from '
-            f'{data.shape} to {shape}'
+            # for example, LZW strips may be missing EOI
+            bps = self.page.bitspersample // 8
+            size = (len(data) // bps) * bps
+            return numpy.frombuffer(data[:size], self.dtype)
+
+cdef class TiffDecoderRGB(TiffDecoderBase):
+    """Decoder for RGB packed integers."""
+    
+    @staticmethod
+    cdef TiffDecoderRGB initialize(TiffPage page, object decompress, object unpredict, int64_t fillorder, object dtype, tuple bitspersample_rgb):
+        cdef TiffDecoderRGB decoder = TiffDecoderRGB(page)
+        decoder.decompress = decompress
+        decoder.unpredict = unpredict
+        decoder.fillorder = fillorder
+        decoder.dtype = dtype
+        decoder.bitspersample_rgb = bitspersample_rgb
+        return decoder
+        
+    cdef object unpack(self, object data):
+        """Return numpy array from packed integers."""
+        return unpack_rgb(data, self.dtype, self.bitspersample_rgb)
+
+cdef class TiffDecoderFloat24(TiffDecoderBase):
+    """Decoder for float24 data type."""
+    
+    @staticmethod
+    cdef TiffDecoderFloat24 initialize(TiffPage page, object decompress, object unpredict, int64_t fillorder, object dtype):
+        cdef TiffDecoderFloat24 decoder = TiffDecoderFloat24(page)
+        decoder.decompress = decompress
+        decoder.unpredict = unpredict
+        decoder.fillorder = fillorder
+        decoder.dtype = dtype
+        return decoder
+
+    cdef object unpack(self, object data):
+        """Return numpy.float32 array from float24."""
+        return imagecodecs.float24_decode(
+            data, byteorder=self.page.tiff.byteorder_str
         )
-    return reshape_func
 
-def create_reshape_strip_func():
-    """Create function to reshape strip data."""
-    def reshape_func(data, indices, shape):
-        size = shape[0] * shape[1] * shape[2] * shape[3]
-        if data.ndim == 1 and data.size > size:
-            data = data[:size]
-        if data.size == size:
-            try:
-                data.shape = shape
-            except AttributeError:
-                data = data.reshape(shape)
-            return data
-        datashape = data.shape
-        try:
-            data.shape = shape[0], -1, shape[2], shape[3]
-            data = data[:, : shape[1]]
-            data.shape = shape
-            return data
-        except ValueError:
-            pass
-        raise TiffFileError(
-            'corrupted strip cannot be reshaped from '
-            f'{datashape} to {shape}'
+cdef class TiffDecoderPackedBits(TiffDecoderBase):
+    """Decoder for bilevel and packed integers."""
+    
+    @staticmethod
+    cdef TiffDecoderPackedBits initialize(TiffPage page, object decompress, object unpredict, int64_t fillorder, object dtype, int64_t bitspersample, int64_t runlen):
+        cdef TiffDecoderPackedBits decoder = TiffDecoderPackedBits(page)
+        decoder.decompress = decompress
+        decoder.unpredict = unpredict
+        decoder.fillorder = fillorder
+        decoder.dtype = dtype
+        decoder.bitspersample = bitspersample
+        decoder.runlen = runlen
+        return decoder
+        
+    cdef object unpack(self, object data):
+        """Return NumPy array from packed integers."""
+        return imagecodecs.packints_decode(
+            data, self.dtype, self.bitspersample, runlen=self.runlen
         )
-    return reshape_func
-
-def create_pad_tile_func(nodata):
-    """Create function to pad tile to shape."""
-    def pad_func(data, shape):
-        if data.shape == shape:
-            return data, shape
-        padwidth = [(0, i - j) for i, j in zip(shape, data.shape)]
-        data = numpy.pad(data, padwidth, constant_values=nodata)
-        return data, shape
-    return pad_func
-
-def create_pad_none_tile_func():
-    """Create function to return shape of tile."""
-    def pad_none_func(shape):
-        return shape
-    return pad_none_func
-
-def create_pad_strip_func(stlength, nodata):
-    """Create function to pad strip to shape."""
-    def pad_func(data, shape):
-        shape = (shape[0], stlength, shape[2], shape[3])
-        if data.shape == shape:
-            return data, shape
-        padwidth = [
-            (0, 0),
-            (0, stlength - data.shape[1]),
-            (0, 0),
-            (0, 0),
-        ]
-        data = numpy.pad(data, padwidth, constant_values=nodata)
-        return data, shape
-    return pad_func
-
-def create_pad_none_strip_func(stlength):
-    """Create function to return shape of strip."""
-    def pad_none_func(shape):
-        return (shape[0], stlength, shape[2], shape[3])
-    return pad_none_func
