@@ -1,15 +1,17 @@
 #cython: language_level=3
 from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
 
-
+from .files cimport FileHandle
 from .format cimport ByteOrder, TiffFormat
+from .tags cimport TiffTags
 
 cdef class TiffPage:
     """TIFF image file directory (IFD)."""
     
     # Public attributes
-    cdef public object parent
-    cdef public object tags
+    cdef public FileHandle fh
+    cdef public TiffFormat tiff
+    cdef public TiffTags tags
     cdef public int64_t offset
     cdef public tuple shape
     cdef public object dtype
@@ -21,6 +23,7 @@ cdef class TiffPage:
     # Internal attributes
     cdef object _dtype
     cdef tuple _index
+    cdef dict _cache
     
     # Page properties
     cdef public int subfiletype
@@ -56,6 +59,50 @@ cdef class TiffPage:
     cpdef bint is_subsampled(self)
     cpdef bint is_jfif(self)
     cpdef int hash(self)
+    cpdef bint is_ndpi(self)
+    cpdef bint is_philips(self)
+    cpdef bint is_eer(self)
+    cpdef bint is_mediacy(self)
+    cpdef bint is_stk(self)
+    cpdef bint is_lsm(self)
+    cpdef bint is_fluoview(self)
+    cpdef bint is_nih(self)
+    cpdef bint is_volumetric(self)
+    cpdef bint is_vista(self)
+    cpdef bint is_metaseries(self)
+    cpdef bint is_ome(self)
+    cpdef bint is_scn(self)
+    cpdef bint is_micromanager(self)
+    cpdef bint is_andor(self)
+    cpdef bint is_pilatus(self)
+    cpdef bint is_epics(self)
+    cpdef bint is_tvips(self)
+    cpdef bint is_fei(self)
+    cpdef bint is_sem(self)
+    cpdef bint is_svs(self)
+    cpdef bint is_bif(self)
+    cpdef bint is_scanimage(self)
+    cpdef bint is_indica(self)
+    cpdef bint is_avs(self)
+    cpdef bint is_qpi(self)
+    cpdef bint is_geotiff(self)
+    cpdef bint is_gdal(self)
+    cpdef bint is_astrotiff(self)
+    cpdef bint is_streak(self)
+    cpdef bint is_dng(self)
+    cpdef bint is_tiffep(self)
+    cpdef bint is_sis(self)
+    cpdef bint is_frame(self)
+    cpdef bint is_virtual(self)
+    cpdef bint is_subifd(self)
+    cpdef bint is_reduced(self)
+    cpdef bint is_multipage(self)
+    cpdef bint is_mask(self)
+    cpdef bint is_mrc(self)
+    cpdef bint is_imagej(self)
+    cpdef bint is_shaped(self)
+    cpdef bint is_mdgel(self)
+    cpdef bint is_agilent(self)
 
 '''
 cdef public TiffTags tags

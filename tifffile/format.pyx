@@ -15,13 +15,11 @@ from .utils import indent
 cdef class TiffFormat:
     """TIFF format properties."""
 
-    @property
-    def is_bigtiff(self) -> bool:
+    cpdef bint is_bigtiff(self):
         """Format is 64-bit BigTIFF."""
         return self.version == 43
 
-    @property
-    def is_ndpi(self) -> bool:
+    cpdef bint is_ndpi(self):
         """Format is 32-bit TIFF with 64-bit offsets used by NDPI."""
         return self.version == 42 and self.offsetsize == 8
         
@@ -36,7 +34,7 @@ cdef class TiffFormat:
     def __repr__(self) -> str:
         bits = '32' if self.version == 42 else '64'
         endian = 'little' if self.byteorder == ByteOrder.II else 'big'
-        ndpi = ' with 64-bit offsets' if self.is_ndpi else ''
+        ndpi = ' with 64-bit offsets' if self.is_ndpi() else ''
         return f'<tifffile.TiffFormat {bits}-bit {endian}-endian{ndpi}>'
 
     def __str__(self) -> str:

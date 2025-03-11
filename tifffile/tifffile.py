@@ -1545,7 +1545,7 @@ def memmap(
                 offset = tiffseries.dataoffset
             else:
                 tiffpage = tif.pages[page]
-                if not tiffpage.is_memmappable:
+                if not tiffpage.is_memmappable():
                     raise ValueError('image data are not memory-mappable')
                 offset = tiffpage.dataoffsets[0]
                 shape = tiffpage.shape
@@ -4680,7 +4680,7 @@ class TiffFile:
         self.pages.useframes = True
         self.pages.set_keyframe(0)
         page = self.pages.first
-        validate = not (page.is_scanimage or page.is_nih)
+        validate = not (page.is_scanimage() or page.is_nih())
         pages = self.pages._getlist(validate=validate)
         if len(pages) == 1:
             shape = page.shape
@@ -4792,7 +4792,7 @@ class TiffFile:
                     reshape = shape
             size = product(shape)
             resize = product(reshape)
-            if page.is_contiguous and resize > size and resize % size == 0:
+            if page.is_contiguous() and resize > size and resize % size == 0:
                 if truncated is None:
                     truncated = True
                 axes = 'Q' + axes
@@ -5006,7 +5006,7 @@ class TiffFile:
         # ImageJ virtual hyperstacks store all image metadata in the first
         # page and image data are stored contiguously before the second
         # page, if any
-        if not page.is_final:
+        if not page.is_final():
             isvirtual = False
         elif page.dataoffsets[0] + nbytes > self.filehandle.size:
             logger().error(
@@ -5314,7 +5314,7 @@ class TiffFile:
                 series_dict['Macro'] = [page]
             elif page.description.startswith('Label'):
                 series_dict['Label'] = [page]
-            elif not page.is_tiled:
+            elif not page.is_tiled():
                 series_dict['Other'].append(page)
             else:
                 series_dict['Level'].append(page)
@@ -5575,7 +5575,7 @@ class TiffFile:
         index = 2
         while index < len(self.pages):
             page = cast(TiffPage, self.pages[index])
-            if not page.is_tiled or page.is_reduced:
+            if not page.is_tiled() or page.is_reduced():
                 break
             if page.shape in levels:
                 levels[page.shape].append(page)
@@ -6641,7 +6641,7 @@ class TiffFile:
         ]
 
         page = cast(TiffPage, self.pages[1])
-        if page.is_reduced:
+        if page.is_reduced():
             pages = self.pages._getlist(slice(1, None, 2), validate=False)
             dtype = page.dtype
             cp = 1
@@ -6920,7 +6920,7 @@ class TiffFile:
             return False
         if page.subifds:
             return False
-        if page.is_scanimage or page.is_nih:
+        if page.is_scanimage() or page.is_nih():
             return True
         i = 0
         useframes = pages.useframes
@@ -6952,7 +6952,7 @@ class TiffFile:
     @property
     def is_bigtiff(self) -> bool:
         """File has BigTIFF format."""
-        return self.tiff.is_bigtiff
+        return self.tiff.is_bigtiff()
 
     @cached_property
     def is_ndtiff(self) -> bool:
@@ -7614,7 +7614,7 @@ class TiffPage_:
         data = fh.read(tagsize * tagno)
         if len(data) != tagsize * tagno:
             raise TiffFileError('corrupted IFD structure')
-        if tiff.is_ndpi:
+        if tiff.is_ndpi():
             # patch offsets/values for 64-bit NDPI file
             tagsize = 16
             fh.seek(8, os.SEEK_CUR)
@@ -10769,7 +10769,7 @@ class TiffPages(Sequence[TiffPage | TiffFrame]):
             if len(pages) > 1:
                 raise ValueError('pages already loaded')
             page = cast(TiffPage, pages[0])
-            if not page.is_contiguous:
+            if not page.is_contiguous():
                 raise ValueError('data not contiguous')
             self._seek(4)
             # following pages are int
@@ -11251,7 +11251,7 @@ class TiffTag_:
             # BYTES, ASCII, UNDEFINED
             value = value[:valuesize]
         elif (
-            tiff.is_ndpi
+            tiff.is_ndpi()
             and count == 1
             and dtype in {4, 9, 13}
             and value[4:] != b'\x00\x00\x00\x00'
@@ -11467,7 +11467,7 @@ class TiffTag_:
                 else:
                     value = struct.pack(fmt, *self.value)
             except Exception as exc:
-                if tiff.is_ndpi and count == 1:
+                if tiff.is_ndpi() and count == 1:
                     raise ValueError(
                         'cannot pack 64-bit NDPI value to 32-bit dtype'
                     ) from exc
@@ -11529,7 +11529,7 @@ class TiffTag_:
 
         fh = self.parent.filehandle
         tiff = self.parent.tiff
-        if tiff.is_ndpi:
+        if tiff.is_ndpi():
             # only support files < 4GB
             if self.count == 1 and self.dtype in {4, 13}:
                 if isinstance(self.value, tuple):
@@ -12479,14 +12479,14 @@ class TiffPageSeries(Sequence[TiffPage | TiffFrame | None]):
         for page in self._pages:
             if page is None or len(page.dataoffsets) == 0:
                 return None
-            if not page.is_final:
+            if not page.is_final():
                 return None
             if not pos:
-                pos = page.dataoffsets[0] + page.nbytes
+                pos = page.dataoffsets[0] + page.nbytes()
                 continue
             if pos != page.dataoffsets[0]:
                 return None
-            pos += page.nbytes
+            pos += page.nbytes()
 
         page = self._pages[0]
         if page is None or len(page.dataoffsets) == 0:
@@ -12495,7 +12495,7 @@ class TiffPageSeries(Sequence[TiffPage | TiffFrame | None]):
         if (
             len(self._pages) == 1
             and isinstance(page, TiffPage)
-            and (page.is_imagej or page.is_shaped or page.is_stk)
+            and (page.is_imagej() or page.is_shaped() or page.is_stk())
         ):
             # truncated files
             return offset

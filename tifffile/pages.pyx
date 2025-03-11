@@ -23,7 +23,6 @@ from .utils import logger, enumarg,\
 
 from concurrent.futures import ThreadPoolExecutor
 cimport cython
-from functools import cached_property
 import math
 import numpy
 import os
@@ -43,6 +42,7 @@ except ImportError:
     except ImportError:
         import _imagecodecs as imagecodecs  # type: ignore[no-redef]
 
+CACHED_DECODERS = dict()
 
 def imagej_metadata(
     data: bytes, bytecounts: Sequence[int], byteorder_str
@@ -316,7 +316,8 @@ cdef class TiffPage:
         cdef TiffFormat tiff = parent.tiff
         cdef int64_t tagno
 
-        self.parent = parent
+        self.fh = parent.filehandle
+        self.tiff = tiff
         self.shape = ()
         self.shaped = (0, 0, 0, 0, 0)
         self.dtype = self._dtype = None
@@ -331,7 +332,7 @@ cdef class TiffPage:
             self._index = tuple(index)
 
         # read IFD structure and its tags from file
-        cdef FileHandle fh = parent.filehandle
+        cdef FileHandle fh = self.fh
         self.offset = fh.tell()  # offset to this IFD
         try:
             tagno = struct.unpack(
@@ -350,7 +351,7 @@ cdef class TiffPage:
         cdef bytes ext
         if len(data) != tagsize * tagno:
             raise TiffFileError('corrupted IFD structure')
-        if tiff.is_ndpi:
+        if tiff.is_ndpi():
             # patch offsets/values for 64-bit NDPI file
             tagsize = 16
             fh.seek(8, os.SEEK_CUR)
@@ -366,8 +367,8 @@ cdef class TiffPage:
             tagdata = data[tagindex : tagindex + tagsize]
             try:
                 tag = TiffTag.fromfile(
-                    parent.filehandle,
-                    parent.tiff,
+                    self.fh,
+                    self.tiff,
                     offset=tagoffset + i * tagsize_,
                     header=tagdata,
                     validate=True
@@ -492,18 +493,18 @@ cdef class TiffPage:
                 elif self.photometric in {0, 1}:
                     self.samplesperpixel = 3
 
-        elif self.is_lsm or (self.index != 0 and self.parent.is_lsm):
+        elif self.is_lsm():# or (self.index != 0 and self.parent.is_lsm()):
             # correct non standard LSM bitspersample tags
             tags[258]._fix_lsm_bitspersample()
             if self.compression == 1 and self.predictor != 1:
                 # work around bug in LSM510 software
                 self.predictor = PREDICTOR.NONE
 
-        elif self.is_vista or (self.index != 0 and self.parent.is_vista):
+        elif self.is_vista():# or (self.index != 0 and self.parent.is_vista()):
             # ISS Vista writes wrong ImageDepth tag
             self.imagedepth = 1
 
-        elif self.is_stk:
+        elif self.is_stk():
             # read UIC1tag again now that plane count is known
             tag = tags.get(33628)  # UIC1tag
             assert tag is not None
@@ -573,7 +574,7 @@ cdef class TiffPage:
                     except ValueError:
                         self.sampleformat = int(value[0])
         elif self.bitspersample == 32 and (
-            self.is_indica or (self.index != 0 and self.parent.is_indica)
+            self.is_indica()# or (self.index != 0 and self.parent.is_indica())
         ):
             # IndicaLabsImageWriter does not write SampleFormat tag
             self.sampleformat = SAMPLEFORMAT.IEEEFP
@@ -660,7 +661,7 @@ cdef class TiffPage:
                 logger().error(f'{self!r} missing ByteCounts tag')
 
         cdef int64_t maxstrips
-        if imagelength and self.rowsperstrip and not self.is_lsm:
+        if imagelength and self.rowsperstrip and not self.is_lsm():
             # fix incorrect number of strip bytecounts and offsets
             maxstrips = (
                 int(
@@ -703,7 +704,7 @@ cdef class TiffPage:
                 self.nodata = 0
 
         mcustarts = tags.valueof(65426)
-        if mcustarts is not None and self.is_ndpi:
+        if mcustarts is not None and self.is_ndpi():
             # use NDPI JPEG McuStarts as tile offsets
             mcustarts = mcustarts.astype(numpy.int64)
             high = tags.valueof(65432)
@@ -764,14 +765,15 @@ cdef class TiffPage:
             TiffFileError:
                 Invalid TIFF structure.
         """
-        if self.hash in self.parent._parent._decoders:
-            return self.parent._parent._decoders[self.hash]
+        global CACHED_DECODERS
+        if self.hash in CACHED_DECODERS:
+            return CACHED_DECODERS[self.hash]
         
         # Create the decoder using the factory method
         decoder = TiffDecoder.create(self)
         
         # Cache the decoder
-        self.parent._parent._decoders[self.hash] = decoder
+        CACHED_DECODERS[self.hash] = decoder
         
         return decoder
 
@@ -817,15 +819,11 @@ cdef class TiffPage:
 
         """
         cdef TiffPage keyframe = self.keyframe  # self or keyframe
-        cdef dict decodeargs
         
-        fh = self.parent.filehandle
-        if lock is None:
-            lock = fh.lock
         if _fullsize is None:
-            _fullsize = keyframe.is_tiled
+            _fullsize = keyframe.is_tiled()
 
-        decodeargs: dict[str, Any] = {'_fullsize': bool(_fullsize)}
+        cdef dict decodeargs = {'_fullsize': bool(_fullsize)}
         if keyframe.compression in {6, 7, 34892, 33007}:  # JPEG
             decodeargs['jpegtables'] = self.jpegtables
             decodeargs['jpegheader'] = keyframe.jpegheader
@@ -843,7 +841,7 @@ cdef class TiffPage:
         if maxworkers is None or maxworkers < 1:
             maxworkers = keyframe.maxworkers
         if maxworkers < 2:
-            for segment in fh.read_segments(
+            for segment in self.fh.read_segments(
                 self.dataoffsets,
                 self.databytecounts,
                 sort=sort,
@@ -856,7 +854,7 @@ cdef class TiffPage:
             # buffersize of segments because ThreadPoolExecutor.map is not
             # collecting iterables lazily
             with ThreadPoolExecutor(maxworkers) as executor:
-                for segments in fh.read_segments(
+                for segments in self.fh.read_segments(
                     self.dataoffsets,
                     self.databytecounts,
                     sort=sort,
@@ -930,14 +928,12 @@ cdef class TiffPage:
         if len(self.dataoffsets) == 0:
             raise TiffFileError('missing data offset')
 
-        fh = self.parent.filehandle
-        if lock is None:
-            lock = fh.lock
+        cdef FileHandle fh = self.fh
 
         if (
             isinstance(out, str)
             and out == 'memmap'
-            and keyframe.is_memmappable
+            and keyframe.is_memmappable()
         ):
             # direct memory map array in file
             with lock:
@@ -948,12 +944,12 @@ cdef class TiffPage:
                     )
                     fh.open()
                 result = fh.memmap_array(
-                    keyframe.parent.byteorder + keyframe._dtype.char,
+                    keyframe.tiff.byteorder + keyframe._dtype.char,
                     keyframe.shaped,
                     offset=self.dataoffsets[0],
                 )
 
-        elif keyframe.is_contiguous:
+        elif keyframe.is_contiguous():
             # read contiguous bytes to array
             if keyframe.is_subsampled():
                 raise NotImplementedError('chroma subsampling not supported')
@@ -968,8 +964,9 @@ cdef class TiffPage:
                     fh.open()
                 fh.seek(self.dataoffsets[0])
                 result = fh.read_array(
-                    keyframe.parent.byteorder + keyframe._dtype.char,
-                    product(keyframe.shaped),
+                    keyframe.tiff.byteorder_str + keyframe._dtype.char,
+                    count=product(keyframe.shaped),
+                    offset=0,
                     out=out,
                 )
             if keyframe.fillorder == 2:
@@ -1161,8 +1158,8 @@ cdef class TiffPage:
 
     def _nextifd(self) -> int:
         """Return offset to next IFD from file."""
-        fh = self.parent.filehandle
-        tiff = self.parent.tiff
+        fh = self.filehandle
+        tiff = self.tiff
         fh.seek(self.offset)
         tagno = struct.unpack(tiff.tagnoformat, fh.read(tiff.tagnosize))[0]
         fh.seek(self.offset + tiff.tagnosize + tagno * tiff.tagsize)
@@ -1204,22 +1201,24 @@ cdef class TiffPage:
         """Number of dimensions in image array."""
         return len(self.shape)
 
-    @property#@cached_property
+    @property
     def dims(self) -> tuple[str, ...]:
         """Names of dimensions in image array."""
         names = TIFF.AXES_NAMES
         return tuple([names[str(ax)] for ax in self.axes])
 
-    @property#@cached_property
+    @property
     def sizes(self) -> dict[str, int]:
         """Ordered map of dimension names to lengths."""
         shape = self.shape
         names = TIFF.AXES_NAMES
         return {names[str(ax)]: shape[i] for i, ax in enumerate(self.axes)}
 
-    @property#@cached_property
+    @property
     def coords(self) -> dict[str, NDArray[Any]]:
         """Ordered map of dimension names to coordinate arrays."""
+        if "coords" in self._cache:
+            return self._cache["coords"]
         resolution = self.get_resolution()
         coords: dict[str, NDArray[Any]] = {}
 
@@ -1249,6 +1248,7 @@ cdef class TiffPage:
                     0, size / step, size, endpoint=False, dtype=numpy.float32
                 )
             assert len(coords[name]) == size
+        self._cache["coords"] = coords
         return coords
 
     @property
@@ -1347,13 +1347,17 @@ cdef class TiffPage:
             resolution.append(value)
         return resolution[0], resolution[1]
 
-    @property#@cached_property
+    @property
     def resolution(self) -> tuple[float, float]:
         """Number of pixels per resolutionunit in X and Y directions."""
+        if "resolution" in self._cache:
+            return self._cache["resolution"]
         # values are returned in (somewhat unexpected) XY order to
         # keep symmetry with the TiffWriter.write resolution argument
         resolution = self.get_resolution()
-        return float(resolution[0]), float(resolution[1])
+        result = (float(resolution[0]), float(resolution[1]))
+        self._cache["resolution"] = result
+        return result
 
     @property
     def resolutionunit(self) -> int:
@@ -1381,10 +1385,12 @@ cdef class TiffPage:
             return (self.tiledepth, self.tilelength, self.tilewidth)
         return (self.tilelength, self.tilewidth)
 
-    @property#@cached_property
+    @property
     def chunks(self) -> tuple[int, ...]:
         """Shape of images in tiles or strips."""
-        shape: list[int] = []
+        if "chunks" in self._cache:
+            return self._cache["chunks"]
+        cdef list shape = []
         if self.tiledepth > 1:
             shape.append(self.tiledepth)
         if self.is_tiled():
@@ -1393,12 +1399,16 @@ cdef class TiffPage:
             shape.extend((self.rowsperstrip, self.imagewidth))
         if self.planarconfig == 1 and self.samplesperpixel > 1:
             shape.append(self.samplesperpixel)
-        return tuple(shape)
+        result = tuple(shape)
+        self._cache["chunks"] = result
+        return result
 
-    @property#@cached_property
+    @property
     def chunked(self) -> tuple[int, ...]:
         """Shape of chunked image."""
-        shape: list[int] = []
+        if "chunked" in self._cache:
+            return self._cache["chunked"]
+        cdef list shape = []
         if self.planarconfig == 2 and self.samplesperpixel > 1:
             shape.append(self.samplesperpixel)
         if self.is_tiled():
@@ -1421,7 +1431,9 @@ cdef class TiffPage:
             shape.append(1)
         if self.planarconfig == 1 and self.samplesperpixel > 1:
             shape.append(1)
-        return tuple(shape)
+        result = tuple(shape)
+        self._cache["chunked"] = result
+        return result
 
     cpdef int hash(self):
         """Checksum to identify pages in same series.
@@ -1446,7 +1458,7 @@ cdef class TiffPage:
         return hash(
             tuple(self.shaped)
             + (
-                self.parent.tiff,
+                self.tiff,
                 self.rowsperstrip,
                 self.tilewidth,
                 self.tilelength,
@@ -1461,22 +1473,26 @@ cdef class TiffPage:
             )
         )
 
-    @property#@cached_property
+    @property
     def pages(self) -> TiffPages | None:
         """Sequence of sub-pages, SubIFDs."""
-        if 330 not in self.tags:
+        if not self.tags.contains_code(330):
             return None
+        if "pages" in self._cache:
+            return self._cache["pages"]
         from .tifffile import TiffPages
-        return TiffPages(self, index=self.index)
+        result = TiffPages(self, index=self.index)
+        self._cache["pages"] = result
+        return result
 
-    @property#@cached_property
+    @property
     def maxworkers(self) -> int:
         """Maximum number of threads for decoding segments.
 
         A value of 0 disables multi-threading also when stacking pages.
 
         """
-        if self.is_contiguous or self.dtype is None:
+        if self.is_contiguous() or self.dtype is None:
             return 0
         if self.compression in TIFF.IMAGE_COMPRESSIONS:
             return min(TIFF.MAXWORKERS, len(self.dataoffsets))
@@ -1494,7 +1510,7 @@ cdef class TiffPage:
                 return min(TIFF.MAXWORKERS, len(self.dataoffsets))
         return 2  # optimum for large number of uncompressed tiles
 
-    @property#@cached_property
+    @property
     def is_contiguous(self) -> bool:
         """Image data is stored contiguously.
 
@@ -1503,62 +1519,73 @@ cdef class TiffPage:
         Excludes prediction and fillorder.
 
         """
+        if "is_contiguous" in self._cache:
+            return self._cache["is_contiguous"]
         if (
             self.sampleformat == 5
             or self.compression != 1
             or self.bitspersample not in {8, 16, 32, 64}
         ):
+            self._cache["is_contiguous"] = False
             return False
-        if 322 in self.tags:  # TileWidth
+        if self.tags.contains_code(322):  # TileWidth
             if (
                 self.imagewidth != self.tilewidth
                 or self.imagelength % self.tilelength
                 or self.tilewidth % 16
                 or self.tilelength % 16
             ):
+                self._cache["is_contiguous"] = False
                 return False
             if (
-                32997 in self.tags  # ImageDepth
-                and 32998 in self.tags  # TileDepth
+                self.tags.contains_code(32997)  # ImageDepth
+                and self.tags.contains_code(32998)  # TileDepth
                 and (
                     self.imagelength != self.tilelength
                     or self.imagedepth % self.tiledepth
                 )
             ):
+                self._cache["is_contiguous"] = False
                 return False
         offsets = self.dataoffsets
         bytecounts = self.databytecounts
         if len(offsets) == 0:
+            self._cache["is_contiguous"] = False
             return False
         if len(offsets) == 1:
+            self._cache["is_contiguous"] = True
             return True
-        if self.is_stk or self.is_lsm:
+        if self.is_stk() or self.is_lsm():
+            self._cache["is_contiguous"] = False
             return True
         if sum(bytecounts) != self.nbytes:
+            self._cache["is_contiguous"] = False
             return False
         if all(
             bytecounts[i] != 0 and offsets[i] + bytecounts[i] == offsets[i + 1]
             for i in range(len(offsets) - 1)
         ):
+            self._cache["is_contiguous"] = True
             return True
+        self._cache["is_contiguous"] = False
         return False
 
-    @property#@cached_property
+    @property
     def is_final(self) -> bool:
         """Image data are stored in final form. Excludes byte-swapping."""
         return (
-            self.is_contiguous
+            self.is_contiguous()
             and self.fillorder == 1
             and self.predictor == 1
             and not self.is_subsampled()
         )
 
-    @property#@cached_property
+    @property
     def is_memmappable(self) -> bool:
         """Image data in file can be memory-mapped to NumPy array."""
         return (
-            self.parent.filehandle.is_file
-            and self.is_final
+            self.fh.is_file
+            and self.is_final()
             # and (self.bitspersample == 8 or self.parent.isnative)
             # aligned?
             and self.dtype is not None
@@ -1581,7 +1608,7 @@ cdef class TiffPage:
             )
         attr = ''
         for name in ('memmappable', 'final', 'contiguous'):
-            attr = getattr(self, 'is_' + name)
+            attr = getattr(self, 'is_' + name)()
             if attr:
                 attr = name.upper()
                 break
@@ -1605,8 +1632,8 @@ cdef class TiffPage:
                     i
                     for i in (
                         PHOTOMETRIC(self.photometric).name,
-                        'REDUCED' if self.is_reduced else '',
-                        'MASK' if self.is_mask else '',
+                        'REDUCED' if self.is_reduced() else '',
+                        'MASK' if self.is_mask() else '',
                         'TILED' if self.is_tiled() else '',
                         tostr('compression'),
                         tostr('planarconfig'),
@@ -1677,22 +1704,29 @@ cdef class TiffPage:
             return None
         return names
 
-    @property#@cached_property
+    @property
     def flags(self) -> set[str]:
         r"""Set of ``is\_\*`` properties that are True."""
-        return {
+        if "flags" in self._cache:
+            return self._cache["flags"]
+        result = {
             name.lower()
             for name in TIFF.PAGE_FLAGS
-            if getattr(self, 'is_' + name)
+            if getattr(self, 'is_' + name)()
         }
+        self._cache["flags"] = result
+        return result
 
-    @property#@cached_property
+    @property
     def andor_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from Andor tags."""
         cdef TiffTag tag
-        if not self.is_andor:
+        if "andor_tags" in self._cache:
+            return self._cache["andor_tags"]
+        if not self.is_andor():
+            self._cache["andor_tags"] = None
             return None
-        result = {'Id': self.tags[4864].value_get()}  # AndorId
+        result = {'Id': self.tags.valueof(4864)}  # AndorId
         for tag in self.tags.values():
             code = tag.code
             if not 4864 < code < 5031:
@@ -1701,9 +1735,10 @@ cdef class TiffPage:
             name = name[5:] if len(name) > 5 else name
             result[name] = tag.value_get()
             # del self.tags[code]
+        self._cache["andor_tags"] = result
         return result
 
-    @property#@cached_property
+    @property
     def epics_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from EPICS areaDetector tags.
 
@@ -1711,10 +1746,13 @@ cdef class TiffPage:
         from the epicsTSSec and epicsTSNsec tags.
 
         """
-        if not self.is_epics:
+        if "epics_tags" in self._cache:
+            return self._cache["epics_tags"]
+        if not self.is_epics():
+            self._cache["epics_tags"] = None
             return None
         result = {}
-        for tag in self.tags:  # list(self.tags.values()):
+        for tag in self.tags.values():
             code = tag.code
             if not 65000 <= code < 65500:
                 continue
@@ -1733,15 +1771,19 @@ cdef class TiffPage:
                 key, value = value.split(':', 1)
                 result[key] = astype(value)
             # del self.tags[code]
+        self._cache["epics_tags"] = result
         return result
 
-    @property#@cached_property
+    @property
     def ndpi_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from Hamamatsu NDPI tags."""
         # TODO: parse 65449 ini style comments
-        if not self.is_ndpi:
+        if "ndpi_tags" in self._cache:
+            return self._cache["ndpi_tags"]
+        if not self.is_ndpi():
+            self._cache["ndpi_tags"] = None
             return None
-        tags = self.tags
+        cdef TiffTags tags = self.tags
         result = {}
         for name in ('Make', 'Model', 'Software'):
             result[name] = tags[name].value
@@ -1758,14 +1800,18 @@ cdef class TiffPage:
                 mcustarts += high
                 del result['McuStartsHighBytes']
             result['McuStarts'] = mcustarts
+        self._cache["ndpi_tags"] = result
         return result
 
-    @property#@cached_property
+    @property
     def geotiff_tags(self) -> dict[str, Any] | None:
         """Consolidated metadata from GeoTIFF tags."""
-        if not self.is_geotiff:
+        if "geotiff_tags" in self._cache:
+            return self._cache["geotiff_tags"]
+        if not self.is_geotiff():
+            self._cache["geotiff_tags"] = None
             return None
-        tags = self.tags
+        cdef TiffTags tags = self.tags
 
         gkd = tags.valueof(34735)  # GeoKeyDirectoryTag
         if gkd is None or len(gkd) < 2 or gkd[0] != 1:
@@ -1882,28 +1928,40 @@ cdef class TiffPage:
                 'SAMP_NUM_COEFF': rpcc[53:73],
                 'SAMP_DEN_COEFF': rpcc[73:],
             }
+        self._cache["geotiff_tags"] = result
         return result
 
-    @property#@cached_property
+    @property
     def shaped_description(self) -> str | None:
         """Description containing array shape if exists, else None."""
+        if "shaped_description" in self._cache:
+            return self._cache["shaped_description"]
         for description in (self.description, self.description1):
             if not description or '"mibi.' in description:
+                self._cache["shaped_description"] = None
                 return None
             if description[:1] == '{' and '"shape":' in description:
+                self._cache["shaped_description"] = description
                 return description
             if description[:6] == 'shape=':
+                self._cache["shaped_description"] = description
                 return description
-        return None
+        self._cache["shaped_description"] = description
+        return description
 
-    @property#@cached_property
+    @property
     def imagej_description(self) -> str | None:
         """ImageJ description if exists, else None."""
+        if "imagej_description" in self._cache:
+            return self._cache["imagej_description"]
         for description in (self.description, self.description1):
             if not description:
+                self._cache["imagej_description"] = None
                 return None
             if description[:7] == 'ImageJ=' or description[:7] == 'SCIFIO=':
+                self._cache["imagej_description"] = description
                 return description
+        self._cache["imagej_description"] = None
         return None
 
     cpdef bint is_jfif(self):
@@ -1916,45 +1974,238 @@ cdef class TiffPage:
             or self.databytecounts[0] < 11
         ):
             return False
-        fh = self.parent.filehandle
-        fh.seek(self.dataoffsets[0] + 6)
-        data = fh.read(4)
+        data = self.fh.read_at(self.dataoffsets[0] + 6, 4)
         return data == b'JFIF'  # or data == b'Exif'
 
-    @property
-    def is_frame(self) -> bool:
+    cpdef bint is_ndpi(self):
+        """Page contains NDPI metadata."""
+        return self.tags.contains_code(65420) and self.tags.contains_code(271)
+
+    cpdef bint is_philips(self):
+        """Page contains Philips DP metadata."""
+        return self.software[:10] == 'Philips DP' and self.description[
+            -16:
+        ].strip().endswith('</DataObject>')
+
+    cpdef bint is_eer(self):
+        """Page contains EER acquisition metadata."""
+        return (
+            self.tiff.is_bigtiff()
+            and self.compression in {1, 65000, 65001, 65002}
+            and self.tags.contains_code(65001)
+            and self.tags.get(65001).datatype == 7
+        )
+
+    cpdef bint is_mediacy(self):
+        """Page contains Media Cybernetics Id tag."""
+        cdef TiffTag tag = self.tags.get(50288)  # MC_Id
+        try:
+            return tag is not None and tag.value_get()[:7] == b'MC TIFF'
+        except Exception:
+            return False
+
+    cpdef bint is_stk(self):
+        """Page contains UIC1Tag tag."""
+        return self.tags.contains_code(33628)
+
+    cpdef bint is_lsm(self):
+        """Page contains CZ_LSMINFO tag."""
+        return self.tags.contains_code(34412)
+
+    cpdef bint is_fluoview(self):
+        """Page contains FluoView MM_STAMP tag."""
+        return self.tags.contains_code(34362)
+
+    cpdef bint is_nih(self):
+        """Page contains NIHImageHeader tag."""
+        return self.tags.contains_code(43314)
+
+    cpdef bint is_volumetric(self):
+        """Page contains SGI ImageDepth tag with value > 1."""
+        return self.imagedepth > 1
+
+    cpdef bint is_vista(self):
+        """Software tag is 'ISS Vista'."""
+        return self.software == 'ISS Vista'
+
+    cpdef bint is_metaseries(self):
+        """Page contains MDS MetaSeries metadata in ImageDescription tag."""
+        if self.index != 0 or self.software != 'MetaSeries':
+            return False
+        d = self.description
+        return d.startswith('<MetaData>') and d.endswith('</MetaData>')
+
+    cpdef bint is_ome(self):
+        """Page contains OME-XML in ImageDescription tag."""
+        if self.index != 0 or not self.description:
+            return False
+        return self.description[-10:].strip().endswith('OME>')
+
+    cpdef bint is_scn(self):
+        """Page contains Leica SCN XML in ImageDescription tag."""
+        if self.index != 0 or not self.description:
+            return False
+        return self.description[-10:].strip().endswith('</scn>')
+
+    cpdef bint is_micromanager(self):
+        """Page contains MicroManagerMetadata tag."""
+        return self.tags.contains_code(51123)
+
+    cpdef bint is_andor(self):
+        """Page contains Andor Technology tags 4864-5030."""
+        return self.tags.contains_code(4864)
+
+    cpdef bint is_pilatus(self):
+        """Page contains Pilatus tags."""
+        return self.software[:8] == 'TVX TIFF' and self.description[:2] == '# '
+
+    cpdef bint is_epics(self):
+        """Page contains EPICS areaDetector tags."""
+        return (
+            self.description == 'EPICS areaDetector'
+            or self.software == 'EPICS areaDetector'
+        )
+
+    cpdef bint is_tvips(self):
+        """Page contains TVIPS metadata."""
+        return self.tags.contains_code(37706)
+
+    cpdef bint is_fei(self):
+        """Page contains FEI_SFEG or FEI_HELIOS tags."""
+        return self.tags.contains_code(34680) or self.tags.contains_code(34682)
+
+    cpdef bint is_sem(self):
+        """Page contains CZ_SEM tag."""
+        return self.tags.contains_code(34118)
+
+    cpdef bint is_svs(self):
+        """Page contains Aperio metadata."""
+        return self.description[:7] == 'Aperio '
+
+    cpdef bint is_bif(self):
+        """Page contains Ventana metadata."""
+        try:
+            return self.tags.contains_code(700) and (
+                # avoid reading XMP tag from file at this point
+                # b'<iScan' in self.tags[700].value[:4096]
+                'Ventana' in self.software
+                or self.software[:17] == 'ScanOutputManager'
+                or self.description == 'Label Image'
+                or self.description == 'Label_Image'
+                or self.description == 'Probability_Image'
+            )
+        except Exception:
+            return False
+
+    cpdef bint is_scanimage(self):
+        """Page contains ScanImage metadata."""
+        return (
+            self.software[:3] == 'SI.'
+            or self.description[:6] == 'state.'
+            or 'scanimage.SI' in self.description[-256:]
+        )
+
+    cpdef bint is_indica(self):
+        """Page contains IndicaLabs metadata."""
+        return self.software[:21] == 'IndicaLabsImageWriter'
+
+    cpdef bint is_avs(self):
+        """Page contains Argos AVS XML metadata."""
+        try:
+            value = self.tags.valueof(65000)
+            return self.tags.contains_code(65000) and value is not None and value[:6] == '<Argos'
+        except Exception:
+            return False
+
+    cpdef bint is_qpi(self):
+        """Page contains PerkinElmer tissue images metadata."""
+        # The ImageDescription tag contains XML with a top-level
+        # <PerkinElmer-QPI-ImageDescription> element
+        return self.software[:15] == 'PerkinElmer-QPI'
+
+    cpdef bint is_geotiff(self):
+        """Page contains GeoTIFF metadata."""
+        return self.tags.contains_code(34735)  # GeoKeyDirectoryTag
+
+    cpdef bint is_gdal(self):
+        """Page contains GDAL metadata."""
+        # startswith '<GDALMetadata>'
+        return self.tags.contains_code(42112)  # GDAL_METADATA
+
+    cpdef bint is_astrotiff(self):
+        """Page contains AstroTIFF FITS metadata."""
+        return (
+            self.description[:7] == 'SIMPLE '
+            and self.description[-3:] == 'END'
+        )
+
+    cpdef bint is_streak(self):
+        """Page contains Hamamatsu streak metadata."""
+        return (
+            self.description[:1] == '['
+            and '],' in self.description[1:32]
+            # and self.tags.get(315, '').value[:19] == 'Copyright Hamamatsu'
+        )
+
+    cpdef bint is_dng(self):
+        """Page contains DNG metadata."""
+        return self.tags.contains_code(50706)  # DNGVersion
+
+    cpdef bint is_tiffep(self):
+        """Page contains TIFF/EP metadata."""
+        return self.tags.contains_code(37398)  # TIFF/EPStandardID
+
+    cpdef bint is_sis(self):
+        """Page contains Olympus SIS metadata."""
+        return self.tags.contains_code(33560) or self.tags.contains_code(33471)
+
+    cpdef bint is_frame(self):
         """Object is :py:class:`TiffFrame` instance."""
         return False
 
-    @property
-    def is_virtual(self) -> bool:
+    cpdef bint is_virtual(self):
         """Page does not have IFD structure in file."""
         return False
 
-    @property
-    def is_subifd(self) -> bool:
+    cpdef bint is_subifd(self):
         """Page is SubIFD of another page."""
         return len(self._index) > 1
 
-    @property
-    def is_reduced(self) -> bool:
+    cpdef bint is_reduced(self):
         """Page is reduced image of another image."""
         return bool(self.subfiletype & 0b1)
 
-    @property
-    def is_multipage(self) -> bool:
+    cpdef bint is_multipage(self):
         """Page is part of multi-page image."""
         return bool(self.subfiletype & 0b10)
 
-    @property
-    def is_mask(self) -> bool:
+    cpdef bint is_mask(self):
         """Page is transparency mask for another image."""
         return bool(self.subfiletype & 0b100)
 
-    @property
-    def is_mrc(self) -> bool:
+    cpdef bint is_mrc(self):
         """Page is part of Mixed Raster Content."""
         return bool(self.subfiletype & 0b1000)
+
+    cpdef bint is_imagej(self):
+        """Page contains ImageJ description metadata."""
+        return self.imagej_description is not None
+
+    cpdef bint is_shaped(self):
+        """Page contains Tifffile JSON metadata."""
+        return self.shaped_description is not None
+
+    cpdef bint is_mdgel(self):
+        """Page contains MDFileTag tag."""
+        return (
+            not self.tags.contains_code(37701)  # AgilentBinary
+            and self.tags.contains_code(33445)  # MDFileTag
+        )
+
+    cpdef bint is_agilent(self):
+        """Page contains Agilent Technologies tags."""
+        # tag 270 and 285 contain color names
+        return self.tags.contains_code(285) and self.tags.contains_code(37701)  # AgilentBinary
 
     cpdef bint is_tiled(self):
         """Page contains tiled image."""
@@ -1969,243 +2220,3 @@ cdef class TiffPage:
         # self.compression == 7
         # and self.photometric == 2
         # and self.planarconfig == 1
-
-    @property
-    def is_imagej(self) -> bool:
-        """Page contains ImageJ description metadata."""
-        return self.imagej_description is not None
-
-    @property
-    def is_shaped(self) -> bool:
-        """Page contains Tifffile JSON metadata."""
-        return self.shaped_description is not None
-
-    @property
-    def is_mdgel(self) -> bool:
-        """Page contains MDFileTag tag."""
-        return (
-            37701 not in self.tags  # AgilentBinary
-            and 33445 in self.tags  # MDFileTag
-        )
-
-    @property
-    def is_agilent(self) -> bool:
-        """Page contains Agilent Technologies tags."""
-        # tag 270 and 285 contain color names
-        return 285 in self.tags and 37701 in self.tags  # AgilentBinary
-
-    @property
-    def is_mediacy(self) -> bool:
-        """Page contains Media Cybernetics Id tag."""
-        tag = self.tags.get(50288)  # MC_Id
-        try:
-            return tag is not None and tag.value[:7] == b'MC TIFF'
-        except Exception:
-            return False
-
-    @property
-    def is_stk(self) -> bool:
-        """Page contains UIC1Tag tag."""
-        return 33628 in self.tags
-
-    @property
-    def is_lsm(self) -> bool:
-        """Page contains CZ_LSMINFO tag."""
-        return 34412 in self.tags
-
-    @property
-    def is_fluoview(self) -> bool:
-        """Page contains FluoView MM_STAMP tag."""
-        return 34362 in self.tags
-
-    @property
-    def is_nih(self) -> bool:
-        """Page contains NIHImageHeader tag."""
-        return 43314 in self.tags
-
-    @property
-    def is_volumetric(self) -> bool:
-        """Page contains SGI ImageDepth tag with value > 1."""
-        return self.imagedepth > 1
-
-    @property
-    def is_vista(self) -> bool:
-        """Software tag is 'ISS Vista'."""
-        return self.software == 'ISS Vista'
-
-    @property
-    def is_metaseries(self) -> bool:
-        """Page contains MDS MetaSeries metadata in ImageDescription tag."""
-        if self.index != 0 or self.software != 'MetaSeries':
-            return False
-        d = self.description
-        return d.startswith('<MetaData>') and d.endswith('</MetaData>')
-
-    @property
-    def is_ome(self) -> bool:
-        """Page contains OME-XML in ImageDescription tag."""
-        if self.index != 0 or not self.description:
-            return False
-        return self.description[-10:].strip().endswith('OME>')
-
-    @property
-    def is_scn(self) -> bool:
-        """Page contains Leica SCN XML in ImageDescription tag."""
-        if self.index != 0 or not self.description:
-            return False
-        return self.description[-10:].strip().endswith('</scn>')
-
-    @property
-    def is_micromanager(self) -> bool:
-        """Page contains MicroManagerMetadata tag."""
-        return 51123 in self.tags
-
-    @property
-    def is_andor(self) -> bool:
-        """Page contains Andor Technology tags 4864-5030."""
-        return 4864 in self.tags
-
-    @property
-    def is_pilatus(self) -> bool:
-        """Page contains Pilatus tags."""
-        return self.software[:8] == 'TVX TIFF' and self.description[:2] == '# '
-
-    @property
-    def is_epics(self) -> bool:
-        """Page contains EPICS areaDetector tags."""
-        return (
-            self.description == 'EPICS areaDetector'
-            or self.software == 'EPICS areaDetector'
-        )
-
-    @property
-    def is_tvips(self) -> bool:
-        """Page contains TVIPS metadata."""
-        return 37706 in self.tags
-
-    @property
-    def is_fei(self) -> bool:
-        """Page contains FEI_SFEG or FEI_HELIOS tags."""
-        return 34680 in self.tags or 34682 in self.tags
-
-    @property
-    def is_sem(self) -> bool:
-        """Page contains CZ_SEM tag."""
-        return 34118 in self.tags
-
-    @property
-    def is_svs(self) -> bool:
-        """Page contains Aperio metadata."""
-        return self.description[:7] == 'Aperio '
-
-    @property
-    def is_bif(self) -> bool:
-        """Page contains Ventana metadata."""
-        try:
-            return 700 in self.tags and (
-                # avoid reading XMP tag from file at this point
-                # b'<iScan' in self.tags[700].value[:4096]
-                'Ventana' in self.software
-                or self.software[:17] == 'ScanOutputManager'
-                or self.description == 'Label Image'
-                or self.description == 'Label_Image'
-                or self.description == 'Probability_Image'
-            )
-        except Exception:
-            return False
-
-    @property
-    def is_scanimage(self) -> bool:
-        """Page contains ScanImage metadata."""
-        return (
-            self.software[:3] == 'SI.'
-            or self.description[:6] == 'state.'
-            or 'scanimage.SI' in self.description[-256:]
-        )
-
-    @property
-    def is_indica(self) -> bool:
-        """Page contains IndicaLabs metadata."""
-        return self.software[:21] == 'IndicaLabsImageWriter'
-
-    @property
-    def is_avs(self) -> bool:
-        """Page contains Argos AVS XML metadata."""
-        try:
-            return (
-                65000 in self.tags and self.tags.valueof(65000)[:6] == '<Argos'
-            )
-        except Exception:
-            return False
-
-    @property
-    def is_qpi(self) -> bool:
-        """Page contains PerkinElmer tissue images metadata."""
-        # The ImageDescription tag contains XML with a top-level
-        # <PerkinElmer-QPI-ImageDescription> element
-        return self.software[:15] == 'PerkinElmer-QPI'
-
-    @property
-    def is_geotiff(self) -> bool:
-        """Page contains GeoTIFF metadata."""
-        return 34735 in self.tags  # GeoKeyDirectoryTag
-
-    @property
-    def is_gdal(self) -> bool:
-        """Page contains GDAL metadata."""
-        # startswith '<GDALMetadata>'
-        return 42112 in self.tags  # GDAL_METADATA
-
-    @property
-    def is_astrotiff(self) -> bool:
-        """Page contains AstroTIFF FITS metadata."""
-        return (
-            self.description[:7] == 'SIMPLE '
-            and self.description[-3:] == 'END'
-        )
-
-    @property
-    def is_streak(self) -> bool:
-        """Page contains Hamamatsu streak metadata."""
-        return (
-            self.description[:1] == '['
-            and '],' in self.description[1:32]
-            # and self.tags.get(315, '').value[:19] == 'Copyright Hamamatsu'
-        )
-
-    @property
-    def is_dng(self) -> bool:
-        """Page contains DNG metadata."""
-        return 50706 in self.tags  # DNGVersion
-
-    @property
-    def is_tiffep(self) -> bool:
-        """Page contains TIFF/EP metadata."""
-        return 37398 in self.tags  # TIFF/EPStandardID
-
-    @property
-    def is_sis(self) -> bool:
-        """Page contains Olympus SIS metadata."""
-        return 33560 in self.tags or 33471 in self.tags
-
-    @property
-    def is_ndpi(self) -> bool:
-        """Page contains NDPI metadata."""
-        return 65420 in self.tags and 271 in self.tags
-
-    @property
-    def is_philips(self) -> bool:
-        """Page contains Philips DP metadata."""
-        return self.software[:10] == 'Philips DP' and self.description[
-            -16:
-        ].strip().endswith('</DataObject>')
-
-    @property
-    def is_eer(self) -> bool:
-        """Page contains EER acquisition metadata."""
-        return (
-            self.parent.is_bigtiff
-            and self.compression in {1, 65000, 65001, 65002}
-            and 65001 in self.tags
-            and self.tags[65001].dtype == 7
-        )

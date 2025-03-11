@@ -1609,7 +1609,7 @@ cdef class TiffTag:
         elif datatype in [1, 2, 7]:
             # direct value of type BYTES, ASCII, UNDEFINED
             value = value_or_offset[:valuesize]
-        elif (tiff_format.is_ndpi
+        elif (tiff_format.is_ndpi()
               and count == 1
               and datatype in [4, 9, 13]
               and value_or_offset[4:] != b'\x00\x00\x00\x00'):
@@ -1846,7 +1846,7 @@ cdef class TiffTag:
                 else:
                     value = struct.pack(fmt, *value)
             except Exception as exc:
-                if tiff.is_ndpi and count == 1:
+                if tiff.is_ndpi() and count == 1:
                     raise ValueError(
                         'cannot pack 64-bit NDPI value to 32-bit dtype'
                     ) from exc
@@ -1900,7 +1900,7 @@ cdef class TiffTag:
 
         fh = filehandle
         tiff = self.tiff_format
-        if tiff.is_ndpi:
+        if tiff.is_ndpi():
             # only support files < 4GB
             if self.count == 1 and self.dtype in {4, 13}:
                 value = self.value_get()

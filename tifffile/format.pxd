@@ -47,7 +47,10 @@ cdef class TiffFormat:
     #@staticmethod
     #cdef TiffFormat detect_format(bytes header)
     """Detect appropriate TIFF format from file header."""
-    
+
+    cpdef bint is_bigtiff(self)
+    cpdef bint is_ndpi(self)
+
     cpdef tuple parse_tag_header(self, bytes header)
     """Parse TIFF tag header and return code, dtype, count, and value."""
     
