@@ -11,9 +11,384 @@ from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
 import numpy
 import imagecodecs
 
+cimport cython
 from .pages cimport TiffPage
-from .utils import TiffFileError
-from .tags import jpeg_decode_colorspace
+
+from .format cimport ByteOrder, TiffFormat
+from .files cimport FileHandle
+from .tags cimport TiffTag, TiffTags
+from .tags import read_uic1tag
+from .types import COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR,\
+    EXTRASAMPLE, RESUNIT, TiffFileError, TIFF
+from .utils cimport product
+from .utils import logger, enumarg,\
+    pformat, astype, strptime, apply_colormap,\
+    create_output, stripnull, bytes2str,\
+    jpeg_decode_colorspace, identityfunc
+
+try:
+    import imagecodecs
+except ImportError:
+    # load pure Python implementation of some codecs
+    try:
+        from . import _imagecodecs as imagecodecs  # type: ignore[no-redef]
+    except ImportError:
+        import _imagecodecs as imagecodecs  # type: ignore[no-redef]
+
+@cython.final
+cdef class CompressionCodec:
+    """Map :py:class:`COMPRESSION` value to encode or decode function.
+
+    Parameters:
+        encode: If *True*, return encode functions, else decode functions.
+
+    """
+
+    cdef dict _codecs#: dict[int, Callable[..., Any]]
+    cdef bint _encode
+
+    def __init__(self, encode: bool) -> None:
+        self._codecs = {1: identityfunc}
+        self._encode = bool(encode)
+
+    def __getitem__(self, key_obj) -> Callable[..., Any]:
+        if key_obj in self._codecs:
+            return self._codecs[key_obj]
+        cdef int64_t key = key_obj
+        codec: Callable[..., Any]
+        try:
+            # TODO: enable CCITTRLE decoder for future imagecodecs
+            # if key == 2:
+            #     if self._encode:
+            #         codec = imagecodecs.ccittrle_encode
+            #     else:
+            #         codec = imagecodecs.ccittrle_decode
+            if key == 5:
+                if self._encode:
+                    codec = imagecodecs.lzw_encode
+                else:
+                    codec = imagecodecs.lzw_decode
+            elif key in {6, 7, 33007}:
+                if self._encode:
+                    if key in {6, 33007}:
+                        raise NotImplementedError
+                    codec = imagecodecs.jpeg_encode
+                else:
+                    codec = imagecodecs.jpeg_decode
+            elif key in {8, 32946, 50013}:
+                if (
+                    hasattr(imagecodecs, 'DEFLATE')
+                    and imagecodecs.DEFLATE.available
+                ):
+                    # imagecodecs built with deflate
+                    if self._encode:
+                        codec = imagecodecs.deflate_encode
+                    else:
+                        codec = imagecodecs.deflate_decode
+                elif (
+                    hasattr(imagecodecs, 'ZLIB') and imagecodecs.ZLIB.available
+                ):
+                    if self._encode:
+                        codec = imagecodecs.zlib_encode
+                    else:
+                        codec = imagecodecs.zlib_decode
+                else:
+                    # imagecodecs built without zlib
+                    try:
+                        from . import _imagecodecs
+                    except ImportError:
+                        import _imagecodecs  # type: ignore[no-redef]
+
+                    if self._encode:
+                        codec = _imagecodecs.zlib_encode
+                    else:
+                        codec = _imagecodecs.zlib_decode
+            elif key == 32773:
+                if self._encode:
+                    codec = imagecodecs.packbits_encode
+                else:
+                    codec = imagecodecs.packbits_decode
+            elif key in {33003, 33004, 33005, 34712}:
+                if self._encode:
+                    codec = imagecodecs.jpeg2k_encode
+                else:
+                    codec = imagecodecs.jpeg2k_decode
+            elif key == 34887:
+                if self._encode:
+                    codec = imagecodecs.lerc_encode
+                else:
+                    codec = imagecodecs.lerc_decode
+            elif key == 34892:
+                # DNG lossy
+                if self._encode:
+                    codec = imagecodecs.jpeg8_encode
+                else:
+                    codec = imagecodecs.jpeg8_decode
+            elif key == 34925:
+                if hasattr(imagecodecs, 'LZMA') and imagecodecs.LZMA.available:
+                    if self._encode:
+                        codec = imagecodecs.lzma_encode
+                    else:
+                        codec = imagecodecs.lzma_decode
+                else:
+                    # imagecodecs built without lzma
+                    try:
+                        from . import _imagecodecs
+                    except ImportError:
+                        import _imagecodecs  # type: ignore[no-redef]
+
+                    if self._encode:
+                        codec = _imagecodecs.lzma_encode
+                    else:
+                        codec = _imagecodecs.lzma_decode
+            elif key == 34933:
+                if self._encode:
+                    codec = imagecodecs.png_encode
+                else:
+                    codec = imagecodecs.png_decode
+            elif key in {34934, 22610}:
+                if self._encode:
+                    codec = imagecodecs.jpegxr_encode
+                else:
+                    codec = imagecodecs.jpegxr_decode
+            elif key == 48124:
+                if self._encode:
+                    codec = imagecodecs.jetraw_encode
+                else:
+                    codec = imagecodecs.jetraw_decode
+            elif key in {50000, 34926}:  # 34926 deprecated
+                if self._encode:
+                    codec = imagecodecs.zstd_encode
+                else:
+                    codec = imagecodecs.zstd_decode
+            elif key in {50001, 34927}:  # 34927 deprecated
+                if self._encode:
+                    codec = imagecodecs.webp_encode
+                else:
+                    codec = imagecodecs.webp_decode
+            elif key in {65000, 65001, 65002} and not self._encode:
+                codec = imagecodecs.eer_decode
+            elif key in {50002, 52546}:
+                if self._encode:
+                    codec = imagecodecs.jpegxl_encode
+                else:
+                    codec = imagecodecs.jpegxl_decode
+            else:
+                try:
+                    msg = f'{COMPRESSION(key)!r} not supported'
+                except ValueError:
+                    msg = f'{key} is not a known COMPRESSION'
+                raise KeyError(msg)
+        except (AttributeError, ImportError) as exc:
+            raise KeyError(
+                f'{COMPRESSION(key)!r} ' "requires the 'imagecodecs' package"
+            ) from exc
+        except NotImplementedError as exc:
+            raise KeyError(f'{COMPRESSION(key)!r} not implemented') from exc
+        self._codecs[key] = codec
+        return codec
+
+    def __contains__(self, key: Any) -> bool:
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+    def __iter__(self) -> Iterator[int]:
+        yield 1  # dummy
+
+    def __len__(self) -> int:
+        return 1  # dummy
+
+
+@cython.final
+cdef class PredictorCodec:
+    """Map :py:class:`PREDICTOR` value to encode or decode function.
+
+    Parameters:
+        encode: If *True*, return encode functions, else decode functions.
+
+    """
+
+    cdef dict _codecs#: dict[int, Callable[..., Any]]
+    cdef bint _encode
+
+    def __init__(self, encode: bool) -> None:
+        self._codecs = {1: identityfunc}
+        self._encode = bool(encode)
+
+    def __getitem__(self, key: int) -> Callable[..., Any]:
+        if key in self._codecs:
+            return self._codecs[key]
+        codec: Callable[..., Any]
+        try:
+            if key == 2:
+                if self._encode:
+                    codec = imagecodecs.delta_encode
+                else:
+                    codec = imagecodecs.delta_decode
+            elif key == 3:
+                if self._encode:
+                    codec = imagecodecs.floatpred_encode
+                else:
+                    codec = imagecodecs.floatpred_decode
+            elif key == 34892:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_encode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_decode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+            elif key == 34893:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_encode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.delta_decode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+            elif key == 34894:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_encode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_decode(
+                            data, axis=axis, out=out, dist=2
+                        )
+
+            elif key == 34895:
+                if self._encode:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_encode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+                else:
+
+                    def codec(data, axis=-1, out=None):
+                        return imagecodecs.floatpred_decode(
+                            data, axis=axis, out=out, dist=4
+                        )
+
+            else:
+                raise KeyError(f'{key} is not a known PREDICTOR')
+        except AttributeError as exc:
+            raise KeyError(
+                f'{PREDICTOR(key)!r}' " requires the 'imagecodecs' package"
+            ) from exc
+        except NotImplementedError as exc:
+            raise KeyError(f'{PREDICTOR(key)!r} not implemented') from exc
+        self._codecs[key] = codec
+        return codec
+
+    def __contains__(self, key: Any) -> bool:
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+    def __iter__(self) -> Iterator[int]:
+        yield 1  # dummy
+
+    def __len__(self) -> int:
+        return 1  # dummy
+
+PREDICTORS = PredictorCodec(True)
+UNPREDICTORS = PredictorCodec(False)
+COMPRESSORS = CompressionCodec(True)
+DECOMPRESSORS = CompressionCodec(False)
+
+
+def unpack_rgb(
+    data: bytes,
+    dtype: DTypeLike | None = None,
+    bitspersample: tuple[int, ...] | None = None,
+    rescale: bool = True,
+) -> NDArray[Any]:
+    """Return array from bytes containing packed samples.
+
+    Use to unpack RGB565 or RGB555 to RGB888 format.
+    Works on little-endian platforms only.
+
+    Parameters:
+        data:
+            Bytes to be decoded.
+            Samples in each pixel are stored consecutively.
+            Pixels are aligned to 8, 16, or 32 bit boundaries.
+        dtype:
+            Data type of samples.
+            The byte order applies also to the data stream.
+        bitspersample:
+            Number of bits for each sample in pixel.
+        rescale:
+            Upscale samples to number of bits in dtype.
+
+    Returns:
+        Flattened array of unpacked samples of native dtype.
+
+    Examples:
+        >>> data = struct.pack('BBBB', 0x21, 0x08, 0xFF, 0xFF)
+        >>> print(unpack_rgb(data, '<B', (5, 6, 5), False))
+        [ 1  1  1 31 63 31]
+        >>> print(unpack_rgb(data, '<B', (5, 6, 5)))
+        [  8   4   8 255 255 255]
+        >>> print(unpack_rgb(data, '<B', (5, 5, 5)))
+        [ 16   8   8 255 255 255]
+
+    """
+    cdef int64_t bits, i, bps
+    cdef int64_t o
+    cdef str dt
+    cdef object data_array, result, t
+    
+    if bitspersample is None:
+        bitspersample = (5, 6, 5)
+    if dtype is None:
+        dtype = '<B'
+    dtype = numpy.dtype(dtype)
+    bits = int(numpy.sum(bitspersample))
+    if not (
+        bits <= 32 and all(i <= dtype.itemsize * 8 for i in bitspersample)
+    ):
+        raise ValueError(f'sample size not supported: {bitspersample}')
+    dt = next(i for i in 'BHI' if numpy.dtype(i).itemsize * 8 >= bits)
+    data_array = numpy.frombuffer(data, dtype.byteorder + dt)
+    result = numpy.empty((data_array.size, len(bitspersample)), dtype.char)
+    for i, bps in enumerate(bitspersample):
+        t = data_array >> int(numpy.sum(bitspersample[i + 1 :]))
+        t &= int('0b' + '1' * bps, 2)
+        if rescale:
+            o = ((dtype.itemsize * 8) // bps + 1) * bps
+            if o > data_array.dtype.itemsize * 8:
+                t = t.astype('I')
+            t *= (2**o - 1) // (2**bps - 1)
+            t //= 2 ** (o - (dtype.itemsize * 8))
+        result[:, i] = t
+    return result.reshape(-1)
 
 cdef class TiffDecoder:
     """Base class for TIFF segment decoders."""
@@ -21,7 +396,7 @@ cdef class TiffDecoder:
     def __init__(self, TiffPage page):
         self.page = page
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         """Decode segment data.
         
         Parameters:
@@ -35,7 +410,7 @@ cdef class TiffDecoder:
         raise NotImplementedError("Subclass must implement __call__")
 
     @staticmethod
-    cdef create(TiffPage page):
+    cdef TiffDecoder create(TiffPage page):
         """Create appropriate decoder for the TIFF page.
         
         Parameters:
@@ -100,7 +475,7 @@ cdef class TiffDecoder:
                 )
 
         # Check chroma subsampling
-        if page.is_subsampled and (
+        if page.is_subsampled() and (
             page.compression not in {6, 7, 34892, 33007}
             or page.planarconfig == 2
         ):
@@ -116,7 +491,7 @@ cdef class TiffDecoder:
             decompress = decompress_webp_rgba
 
         # Normalize segments shape to [depth, length, width, contig]
-        if page.is_tiled:
+        if page.is_tiled():
             stshape = (
                 page.tiledepth,
                 page.tilelength,
@@ -135,7 +510,7 @@ cdef class TiffDecoder:
         _, imdepth, imlength, imwidth, _ = page.shaped
 
         # Create helper functions based on tiled or strip mode
-        if page.is_tiled:
+        if page.is_tiled():
             width = (imwidth + stwidth - 1) // stwidth
             length = (imlength + stlength - 1) // stlength
             depth = (imdepth + stdepth - 1) // stdepth
@@ -299,7 +674,7 @@ cdef class TiffDecoderError(TiffDecoder):
         super().__init__(page)
         self.error_message = error_message
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         raise ValueError(self.error_message)
 
 cdef class TiffDecoderJpeg(TiffDecoder):
@@ -309,14 +684,14 @@ cdef class TiffDecoderJpeg(TiffDecoder):
                  object pad_func, object pad_none_func):
         super().__init__(page)
         self.colorspace, self.outcolorspace = jpeg_decode_colorspace(
-            page.photometric, page.planarconfig, page.extrasamples, page.is_jfif
+            page.photometric, page.planarconfig, page.extrasamples, page.is_jfif()
         )
         self.indices_func = indices_func
         self.reshape_func = reshape_func
         self.pad_func = pad_func
         self.pad_none_func = pad_none_func
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef object jpegtables = kwargs.get('jpegtables', None)
         cdef object jpegheader = kwargs.get('jpegheader', None)
@@ -355,7 +730,7 @@ cdef class TiffDecoderEer(TiffDecoder):
         self.indices_func = indices_func
         self.pad_none_func = pad_none_func
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         
         segmentindex, shape = self.indices_func(index)
@@ -384,7 +759,7 @@ cdef class TiffDecoderJetraw(TiffDecoder):
         self.indices_func = indices_func
         self.pad_none_func = pad_none_func
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         
         segmentindex, shape = self.indices_func(index)
@@ -409,7 +784,7 @@ cdef class TiffDecoderImage(TiffDecoder):
         self.pad_func = pad_func
         self.pad_none_func = pad_none_func
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         
         segmentindex, shape = self.indices_func(index)
@@ -442,7 +817,7 @@ cdef class TiffDecoderOther(TiffDecoder):
         self.pad_func = pad_func
         self.pad_none_func = pad_none_func
         
-    cpdef tuple __call__(self, object data, int64_t index, **kwargs):
+    def __call__(self, object data, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         
         segmentindex, shape = self.indices_func(index)

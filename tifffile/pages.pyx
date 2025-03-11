@@ -30,6 +30,9 @@ import os
 import struct
 import warnings
 
+from .decoder cimport TiffDecoder
+from .decoder import PREDICTORS, UNPREDICTORS, COMPRESSORS, DECOMPRESSORS
+
 
 try:
     import imagecodecs
@@ -40,292 +43,6 @@ except ImportError:
     except ImportError:
         import _imagecodecs as imagecodecs  # type: ignore[no-redef]
 
-@cython.final
-cdef class CompressionCodec:
-    """Map :py:class:`COMPRESSION` value to encode or decode function.
-
-    Parameters:
-        encode: If *True*, return encode functions, else decode functions.
-
-    """
-
-    cdef dict _codecs#: dict[int, Callable[..., Any]]
-    cdef bint _encode
-
-    def __init__(self, encode: bool) -> None:
-        self._codecs = {1: identityfunc}
-        self._encode = bool(encode)
-
-    def __getitem__(self, key_obj) -> Callable[..., Any]:
-        if key_obj in self._codecs:
-            return self._codecs[key_obj]
-        cdef int64_t key = key_obj
-        codec: Callable[..., Any]
-        try:
-            # TODO: enable CCITTRLE decoder for future imagecodecs
-            # if key == 2:
-            #     if self._encode:
-            #         codec = imagecodecs.ccittrle_encode
-            #     else:
-            #         codec = imagecodecs.ccittrle_decode
-            if key == 5:
-                if self._encode:
-                    codec = imagecodecs.lzw_encode
-                else:
-                    codec = imagecodecs.lzw_decode
-            elif key in {6, 7, 33007}:
-                if self._encode:
-                    if key in {6, 33007}:
-                        raise NotImplementedError
-                    codec = imagecodecs.jpeg_encode
-                else:
-                    codec = imagecodecs.jpeg_decode
-            elif key in {8, 32946, 50013}:
-                if (
-                    hasattr(imagecodecs, 'DEFLATE')
-                    and imagecodecs.DEFLATE.available
-                ):
-                    # imagecodecs built with deflate
-                    if self._encode:
-                        codec = imagecodecs.deflate_encode
-                    else:
-                        codec = imagecodecs.deflate_decode
-                elif (
-                    hasattr(imagecodecs, 'ZLIB') and imagecodecs.ZLIB.available
-                ):
-                    if self._encode:
-                        codec = imagecodecs.zlib_encode
-                    else:
-                        codec = imagecodecs.zlib_decode
-                else:
-                    # imagecodecs built without zlib
-                    try:
-                        from . import _imagecodecs
-                    except ImportError:
-                        import _imagecodecs  # type: ignore[no-redef]
-
-                    if self._encode:
-                        codec = _imagecodecs.zlib_encode
-                    else:
-                        codec = _imagecodecs.zlib_decode
-            elif key == 32773:
-                if self._encode:
-                    codec = imagecodecs.packbits_encode
-                else:
-                    codec = imagecodecs.packbits_decode
-            elif key in {33003, 33004, 33005, 34712}:
-                if self._encode:
-                    codec = imagecodecs.jpeg2k_encode
-                else:
-                    codec = imagecodecs.jpeg2k_decode
-            elif key == 34887:
-                if self._encode:
-                    codec = imagecodecs.lerc_encode
-                else:
-                    codec = imagecodecs.lerc_decode
-            elif key == 34892:
-                # DNG lossy
-                if self._encode:
-                    codec = imagecodecs.jpeg8_encode
-                else:
-                    codec = imagecodecs.jpeg8_decode
-            elif key == 34925:
-                if hasattr(imagecodecs, 'LZMA') and imagecodecs.LZMA.available:
-                    if self._encode:
-                        codec = imagecodecs.lzma_encode
-                    else:
-                        codec = imagecodecs.lzma_decode
-                else:
-                    # imagecodecs built without lzma
-                    try:
-                        from . import _imagecodecs
-                    except ImportError:
-                        import _imagecodecs  # type: ignore[no-redef]
-
-                    if self._encode:
-                        codec = _imagecodecs.lzma_encode
-                    else:
-                        codec = _imagecodecs.lzma_decode
-            elif key == 34933:
-                if self._encode:
-                    codec = imagecodecs.png_encode
-                else:
-                    codec = imagecodecs.png_decode
-            elif key in {34934, 22610}:
-                if self._encode:
-                    codec = imagecodecs.jpegxr_encode
-                else:
-                    codec = imagecodecs.jpegxr_decode
-            elif key == 48124:
-                if self._encode:
-                    codec = imagecodecs.jetraw_encode
-                else:
-                    codec = imagecodecs.jetraw_decode
-            elif key in {50000, 34926}:  # 34926 deprecated
-                if self._encode:
-                    codec = imagecodecs.zstd_encode
-                else:
-                    codec = imagecodecs.zstd_decode
-            elif key in {50001, 34927}:  # 34927 deprecated
-                if self._encode:
-                    codec = imagecodecs.webp_encode
-                else:
-                    codec = imagecodecs.webp_decode
-            elif key in {65000, 65001, 65002} and not self._encode:
-                codec = imagecodecs.eer_decode
-            elif key in {50002, 52546}:
-                if self._encode:
-                    codec = imagecodecs.jpegxl_encode
-                else:
-                    codec = imagecodecs.jpegxl_decode
-            else:
-                try:
-                    msg = f'{COMPRESSION(key)!r} not supported'
-                except ValueError:
-                    msg = f'{key} is not a known COMPRESSION'
-                raise KeyError(msg)
-        except (AttributeError, ImportError) as exc:
-            raise KeyError(
-                f'{COMPRESSION(key)!r} ' "requires the 'imagecodecs' package"
-            ) from exc
-        except NotImplementedError as exc:
-            raise KeyError(f'{COMPRESSION(key)!r} not implemented') from exc
-        self._codecs[key] = codec
-        return codec
-
-    def __contains__(self, key: Any) -> bool:
-        try:
-            self[key]
-        except KeyError:
-            return False
-        return True
-
-    def __iter__(self) -> Iterator[int]:
-        yield 1  # dummy
-
-    def __len__(self) -> int:
-        return 1  # dummy
-
-
-@cython.final
-cdef class PredictorCodec:
-    """Map :py:class:`PREDICTOR` value to encode or decode function.
-
-    Parameters:
-        encode: If *True*, return encode functions, else decode functions.
-
-    """
-
-    cdef dict _codecs#: dict[int, Callable[..., Any]]
-    cdef bint _encode
-
-    def __init__(self, encode: bool) -> None:
-        self._codecs = {1: identityfunc}
-        self._encode = bool(encode)
-
-    def __getitem__(self, key: int) -> Callable[..., Any]:
-        if key in self._codecs:
-            return self._codecs[key]
-        codec: Callable[..., Any]
-        try:
-            if key == 2:
-                if self._encode:
-                    codec = imagecodecs.delta_encode
-                else:
-                    codec = imagecodecs.delta_decode
-            elif key == 3:
-                if self._encode:
-                    codec = imagecodecs.floatpred_encode
-                else:
-                    codec = imagecodecs.floatpred_decode
-            elif key == 34892:
-                if self._encode:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.delta_encode(
-                            data, axis=axis, out=out, dist=2
-                        )
-
-                else:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.delta_decode(
-                            data, axis=axis, out=out, dist=2
-                        )
-
-            elif key == 34893:
-                if self._encode:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.delta_encode(
-                            data, axis=axis, out=out, dist=4
-                        )
-
-                else:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.delta_decode(
-                            data, axis=axis, out=out, dist=4
-                        )
-
-            elif key == 34894:
-                if self._encode:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.floatpred_encode(
-                            data, axis=axis, out=out, dist=2
-                        )
-
-                else:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.floatpred_decode(
-                            data, axis=axis, out=out, dist=2
-                        )
-
-            elif key == 34895:
-                if self._encode:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.floatpred_encode(
-                            data, axis=axis, out=out, dist=4
-                        )
-
-                else:
-
-                    def codec(data, axis=-1, out=None):
-                        return imagecodecs.floatpred_decode(
-                            data, axis=axis, out=out, dist=4
-                        )
-
-            else:
-                raise KeyError(f'{key} is not a known PREDICTOR')
-        except AttributeError as exc:
-            raise KeyError(
-                f'{PREDICTOR(key)!r}' " requires the 'imagecodecs' package"
-            ) from exc
-        except NotImplementedError as exc:
-            raise KeyError(f'{PREDICTOR(key)!r} not implemented') from exc
-        self._codecs[key] = codec
-        return codec
-
-    def __contains__(self, key: Any) -> bool:
-        try:
-            self[key]
-        except KeyError:
-            return False
-        return True
-
-    def __iter__(self) -> Iterator[int]:
-        yield 1  # dummy
-
-    def __len__(self) -> int:
-        return 1  # dummy
-
-PREDICTORS = PredictorCodec(True)
-UNPREDICTORS = PredictorCodec(False)
-COMPRESSORS = CompressionCodec(True)
-DECOMPRESSORS = CompressionCodec(False)
 
 def imagej_metadata(
     data: bytes, bytecounts: Sequence[int], byteorder_str
@@ -540,72 +257,6 @@ def ndpi_jpeg_tile(jpeg: bytes) -> tuple[int, int, bytes]:
     )
     return tilelength, tilewidth, jpegheader
 
-def unpack_rgb(
-    data: bytes,
-    dtype: DTypeLike | None = None,
-    bitspersample: tuple[int, ...] | None = None,
-    rescale: bool = True,
-) -> NDArray[Any]:
-    """Return array from bytes containing packed samples.
-
-    Use to unpack RGB565 or RGB555 to RGB888 format.
-    Works on little-endian platforms only.
-
-    Parameters:
-        data:
-            Bytes to be decoded.
-            Samples in each pixel are stored consecutively.
-            Pixels are aligned to 8, 16, or 32 bit boundaries.
-        dtype:
-            Data type of samples.
-            The byte order applies also to the data stream.
-        bitspersample:
-            Number of bits for each sample in pixel.
-        rescale:
-            Upscale samples to number of bits in dtype.
-
-    Returns:
-        Flattened array of unpacked samples of native dtype.
-
-    Examples:
-        >>> data = struct.pack('BBBB', 0x21, 0x08, 0xFF, 0xFF)
-        >>> print(unpack_rgb(data, '<B', (5, 6, 5), False))
-        [ 1  1  1 31 63 31]
-        >>> print(unpack_rgb(data, '<B', (5, 6, 5)))
-        [  8   4   8 255 255 255]
-        >>> print(unpack_rgb(data, '<B', (5, 5, 5)))
-        [ 16   8   8 255 255 255]
-
-    """
-    cdef int64_t bits, i, bps
-    cdef int64_t o
-    cdef str dt
-    cdef object data_array, result, t
-    
-    if bitspersample is None:
-        bitspersample = (5, 6, 5)
-    if dtype is None:
-        dtype = '<B'
-    dtype = numpy.dtype(dtype)
-    bits = int(numpy.sum(bitspersample))
-    if not (
-        bits <= 32 and all(i <= dtype.itemsize * 8 for i in bitspersample)
-    ):
-        raise ValueError(f'sample size not supported: {bitspersample}')
-    dt = next(i for i in 'BHI' if numpy.dtype(i).itemsize * 8 >= bits)
-    data_array = numpy.frombuffer(data, dtype.byteorder + dt)
-    result = numpy.empty((data_array.size, len(bitspersample)), dtype.char)
-    for i, bps in enumerate(bitspersample):
-        t = data_array >> int(numpy.sum(bitspersample[i + 1 :]))
-        t &= int('0b' + '1' * bps, 2)
-        if rescale:
-            o = ((dtype.itemsize * 8) // bps + 1) * bps
-            if o > data_array.dtype.itemsize * 8:
-                t = t.astype('I')
-            t *= (2**o - 1) // (2**bps - 1)
-            t //= 2 ** (o - (dtype.itemsize * 8))
-        result[:, i] = t
-    return result.reshape(-1)
 
 @cython.final
 cdef class TiffPage:
@@ -626,88 +277,6 @@ cdef class TiffPage:
         TiffFileError: Invalid TIFF structure.
 
     """
-    cdef public TiffTags tags
-    """Tags belonging to page."""
-    cdef public object parent
-    """TiffFile instance page belongs to."""
-    cdef public int64_t offset
-    """Position of page in file."""
-    cdef public tuple shape#: tuple[int, ...]
-    """Shape of image array in page."""
-    cdef public object dtype#: numpy.dtype[Any] | None
-    """Data type of image array in page."""
-    cdef public int64_t[5] shaped
-    """Normalized 5-dimensional shape of image array in page:
-
-        0. separate samplesperpixel or 1.
-        1. imagedepth or 1.
-        2. imagelength.
-        3. imagewidth.
-        4. contig samplesperpixel or 1.
-
-    """
-    cdef public str axes
-    """Character codes for dimensions in image array:
-    'S' sample, 'X' width, 'Y' length, 'Z' depth.
-    """
-    cdef public tuple dataoffsets#: tuple[int, ...]
-    """Positions of strips or tiles in file."""
-    cdef public tuple databytecounts#: tuple[int, ...]
-    """Size of strips or tiles in file."""
-    cdef object _dtype#: numpy.dtype[Any] | None
-    cdef tuple _index#: tuple[int, ...]  # index of page in IFD tree
-
-    # default properties; might be updated from tags
-    cdef public int subfiletype
-    """:py:class:`FILETYPE` kind of image."""
-    cdef public int imagewidth
-    """Number of columns (pixels per row) in image."""
-    cdef public int imagelength
-    """Number of rows in image."""
-    cdef public int imagedepth
-    """Number of Z slices in image."""
-    cdef public int tilewidth
-    """Number of columns in each tile."""
-    cdef public int tilelength
-    """Number of rows in each tile."""
-    cdef public int tiledepth
-    """Number of Z slices in each tile."""
-    cdef public int samplesperpixel
-    """Number of components per pixel."""
-    cdef public int bitspersample
-    """Number of bits per pixel component."""
-    cdef public int sampleformat
-    """:py:class:`SAMPLEFORMAT` type of pixel components."""
-    cdef public int rowsperstrip
-    """Number of rows per strip."""
-    cdef public int compression
-    """:py:class:`COMPRESSION` scheme used on image data."""
-    cdef public int planarconfig
-    """:py:class:`PLANARCONFIG` type of storage of components in pixel."""
-    cdef public int fillorder
-    """Logical order of bits within byte of image data."""
-    cdef public int photometric
-    """:py:class:`PHOTOMETRIC` color space of image."""
-    cdef public int predictor
-    """:py:class:`PREDICTOR` applied to image data before compression."""
-    cdef public tuple extrasamples # tuple[int, ...]
-    """:py:class:`EXTRASAMPLE` interpretation of extra components in pixel."""
-    cdef public tuple subsampling # int64_t[2]
-    """Subsampling factors used for chrominance components."""
-    cdef public tuple subifds # tuple[int, ...]
-    """Positions of SubIFDs in file."""
-    cdef public bytes jpegtables
-    """JPEG quantization and Huffman tables."""
-    cdef public bytes jpegheader
-    """JPEG header for NDPI."""
-    cdef public str software
-    """Software used to create image."""
-    cdef public str description
-    """Subject of image."""
-    cdef public str description1
-    """Value of second ImageDescription tag."""
-    cdef public float nodata # int | float
-    """Value used for missing data. The value of the GDAL_NODATA tag or 0."""
 
     def __cinit__(self):
         self.subfiletype = 0
@@ -1166,21 +735,12 @@ cdef class TiffPage:
                 mcustarts += self.dataoffsets[0]
                 self.dataoffsets = tuple(mcustarts.tolist())
 
-    @property#@cached_property
-    def decode(
-        self,
-    ) -> Callable[
-        ...,
-        tuple[
-            NDArray[Any] | None,
-            tuple[int, int, int, int, int],
-            tuple[int, int, int, int],
-        ],
-    ]:
-        """Return decoded segment, its shape, and indices in image.
+    @property
+    def decode(self):
+        """Return decoder for segments.
 
-        The decode function is implemented as a closure and has the following
-        signature:
+        The decoder is a callable class instance that decodes image segments 
+        with the following signature:
 
         Parameters:
             data (Union[bytes, None]):
@@ -1188,9 +748,8 @@ cdef class TiffPage:
                 segments.
             index (int):
                 Index of segment in Offsets and Bytecount tag values.
-            jpegtables (Optional[bytes]):
-                For JPEG compressed segments only, value of JPEGTables tag
-                if any.
+            **kwargs:
+                Additional parameters like jpegtables, jpegheader, _fullsize.
 
         Returns:
             - Decoded segment or None for empty segments.
@@ -1204,556 +763,17 @@ cdef class TiffPage:
                 Decoding is not supported.
             TiffFileError:
                 Invalid TIFF structure.
-
         """
-        cdef int64_t stdepth, stlength, stwidth, samples, imdepth, imlength, imwidth
-        cdef int64_t width, length, depth, size
-        
         if self.hash in self.parent._parent._decoders:
             return self.parent._parent._decoders[self.hash]
-
-        def cache(decode):
-            self.parent._parent._decoders[self.hash] = decode
-            return decode
-
-        if self.dtype is None or self._dtype is None:
-
-            def decode_raise_dtype(*args, **kwargs):
-                raise ValueError(
-                    'data type not supported '
-                    f'(SampleFormat {self.sampleformat}, '
-                    f'{self.bitspersample}-bit)'
-                )
-
-            return cache(decode_raise_dtype)
-
-        if 0 in tuple(self.shaped):
-
-            def decode_raise_empty(*args, **kwargs):
-                raise ValueError('empty image')
-
-            return cache(decode_raise_empty)
-
-        try:
-            if self.compression == 1:
-                decompress = None
-            else:
-                decompress = DECOMPRESSORS[self.compression]
-            if (
-                self.compression in {65000, 65001, 65002}
-                and not self.parent.is_eer
-            ):
-                raise KeyError(self.compression)
-        except KeyError as exc:
-
-            def decode_raise_compression(*args, exc=str(exc)[1:-1], **kwargs):
-                raise ValueError(f'{exc}')
-
-            return cache(decode_raise_compression)
-
-        try:
-            if self.predictor == 1:
-                unpredict = None
-            else:
-                unpredict = UNPREDICTORS[self.predictor]
-        except KeyError as exc:
-            if self.compression in TIFF.IMAGE_COMPRESSIONS:
-                logger().warning(
-                    f'{self!r} ignoring predictor {self.predictor}'
-                )
-                unpredict = None
-
-            else:
-
-                def decode_raise_predictor(
-                    *args, exc=str(exc)[1:-1], **kwargs
-                ):
-                    raise ValueError(f'{exc}')
-
-                return cache(decode_raise_predictor)
-
-        if self.tags.get(339) is not None:
-            tag = self.tags[339]  # SampleFormat
-            if tag.count != 1 and any(i - tag.value[0] for i in tag.value_get()):
-
-                def decode_raise_sampleformat(*args, **kwargs):
-                    raise ValueError(
-                        f'sample formats do not match {tag.value}'
-                    )
-
-                return cache(decode_raise_sampleformat)
-
-        if self.is_subsampled and (
-            self.compression not in {6, 7, 34892, 33007}
-            or self.planarconfig == 2
-        ):
-
-            def decode_raise_subsampling(*args, **kwargs):
-                raise NotImplementedError(
-                    'chroma subsampling not supported without JPEG compression'
-                )
-
-            return cache(decode_raise_subsampling)
-
-        if self.compression == 50001 and self.samplesperpixel == 4:
-            # WebP segments may be missing all-opaque alpha channel
-            def decompress_webp_rgba(data, out=None):
-                return imagecodecs.webp_decode(data, hasalpha=True, out=out)
-
-            decompress = decompress_webp_rgba
-
-        # normalize segments shape to [depth, length, width, contig]
-        if self.is_tiled:
-            stshape = (
-                self.tiledepth,
-                self.tilelength,
-                self.tilewidth,
-                self.samplesperpixel if self.planarconfig == 1 else 1,
-            )
-        else:
-            stshape = (
-                1,
-                self.rowsperstrip,
-                self.imagewidth,
-                self.samplesperpixel if self.planarconfig == 1 else 1,
-            )
-
-        stdepth, stlength, stwidth, samples = stshape
-        _, imdepth, imlength, imwidth, samples = self.shaped
-
-        if self.is_tiled:
-            width = (imwidth + stwidth - 1) // stwidth
-            length = (imlength + stlength - 1) // stlength
-            depth = (imdepth + stdepth - 1) // stdepth
-
-            def indices(
-                segmentindex: int
-            ) -> tuple[
-                tuple[int, int, int, int, int], tuple[int, int, int, int]
-            ]:
-                # return indices and shape of tile in image array
-                return (
-                    (
-                        segmentindex // (width * length * depth),
-                        (segmentindex // (width * length)) % depth * stdepth,
-                        (segmentindex // width) % length * stlength,
-                        segmentindex % width * stwidth,
-                        0,
-                    ),
-                    stshape,
-                )
-
-            def reshape(
-                data: NDArray[Any],
-                indices: tuple[int, int, int, int, int],
-                shape: tuple[int, int, int, int]
-            ) -> NDArray[Any]:
-                cdef int64_t size = shape[0] * shape[1] * shape[2] * shape[3]
-                # return reshaped tile or raise TiffFileError
-                if data.ndim == 1 and data.size > size:
-                    # decompression / unpacking might return too many bytes
-                    data = data[:size]
-                if data.size == size:
-                    # complete tile
-                    # data might be non-contiguous; cannot reshape inplace
-                    return data.reshape(shape)
-                try:
-                    # data fills remaining space
-                    # found in JPEG/PNG compressed tiles
-                    return data.reshape(
-                        (
-                            min(imdepth - indices[1], shape[0]),
-                            min(imlength - indices[2], shape[1]),
-                            min(imwidth - indices[3], shape[2]),
-                            samples,
-                        )
-                    )
-                except ValueError:
-                    pass
-                try:
-                    # data fills remaining horizontal space
-                    # found in tiled GeoTIFF
-                    return data.reshape(
-                        (
-                            min(imdepth - indices[1], shape[0]),
-                            min(imlength - indices[2], shape[1]),
-                            shape[2],
-                            samples,
-                        )
-                    )
-                except ValueError:
-                    pass
-                raise TiffFileError(
-                    f'corrupted tile @ {indices} cannot be reshaped from '
-                    f'{data.shape} to {shape}'
-                )
-
-            def pad(
-                data: NDArray[Any], shape: tuple[int, int, int, int]
-            ) -> tuple[NDArray[Any], tuple[int, int, int, int]]:
-                # pad tile to shape
-                if data.shape == shape:
-                    return data, shape
-                padwidth = [(0, i - j) for i, j in zip(shape, data.shape)]
-                data = numpy.pad(data, padwidth, constant_values=self.nodata)
-                return data, shape
-
-            def pad_none(
-                shape: tuple[int, int, int, int]
-            ) -> tuple[int, int, int, int]:
-                # return shape of tile
-                return shape
-
-        else:
-            # strips
-            length = (imlength + stlength - 1) // stlength
-
-            def indices(
-                segmentindex: int
-            ) -> tuple[
-                tuple[int, int, int, int, int], tuple[int, int, int, int]
-            ]:
-                # return indices and shape of strip in image array
-                indices = (
-                    segmentindex // (length * imdepth),
-                    (segmentindex // length) % imdepth * stdepth,
-                    segmentindex % length * stlength,
-                    0,
-                    0,
-                )
-                shape = (
-                    stdepth,
-                    min(stlength, imlength - indices[2]),
-                    stwidth,
-                    samples,
-                )
-                return indices, shape
-
-            def reshape(
-                data: NDArray[Any],
-                indices: tuple[int, int, int, int, int],
-                shape: tuple[int, int, int, int]
-            ) -> NDArray[Any]:
-                # return reshaped strip or raise TiffFileError
-                cdef int64_t size = shape[0] * shape[1] * shape[2] * shape[3]
-                if data.ndim == 1 and data.size > size:
-                    # decompression / unpacking might return too many bytes
-                    data = data[:size]
-                if data.size == size:
-                    # expected size
-                    try:
-                        data.shape = shape
-                    except AttributeError:
-                        # incompatible shape for in-place modification
-                        # decoder returned non-contiguous array
-                        data = data.reshape(shape)
-                    return data
-                datashape = data.shape
-                try:
-                    # too many rows?
-                    data.shape = shape[0], -1, shape[2], shape[3]
-                    data = data[:, : shape[1]]
-                    data.shape = shape
-                    return data
-                except ValueError:
-                    pass
-                raise TiffFileError(
-                    'corrupted strip cannot be reshaped from '
-                    f'{datashape} to {shape}'
-                )
-
-            def pad(
-                data: NDArray[Any], shape: tuple[int, int, int, int]
-            ) -> tuple[NDArray[Any], tuple[int, int, int, int]]:
-                # pad strip length to rowsperstrip
-                shape = (shape[0], stlength, shape[2], shape[3])
-                if data.shape == shape:
-                    return data, shape
-                padwidth = [
-                    (0, 0),
-                    (0, stlength - data.shape[1]),
-                    (0, 0),
-                    (0, 0),
-                ]
-                data = numpy.pad(data, padwidth, constant_values=self.nodata)
-                return data, shape
-
-            def pad_none(
-                shape: tuple[int, int, int, int]
-            ) -> tuple[int, int, int, int]:
-                # return shape of strip
-                return (shape[0], stlength, shape[2], shape[3])
-
-        if self.compression in {6, 7, 34892, 33007}:
-            # JPEG needs special handling
-            if self.fillorder == 2:
-                logger().debug(f'{self!r} disabling LSB2MSB for JPEG')
-            if unpredict:
-                logger().debug(f'{self!r} disabling predictor for JPEG')
-            if 28672 in self.tags:  # SonyRawFileType
-                logger().warning(
-                    f'{self!r} SonyRawFileType might need additional '
-                    'unpacking (see issue #95)'
-                )
-
-            colorspace, outcolorspace = jpeg_decode_colorspace(
-                self.photometric,
-                self.planarconfig,
-                self.extrasamples,
-                self.is_jfif,
-            )
-
-            def decode_jpeg(
-                data: bytes | None,
-                index: int,
-                *,
-                jpegtables: bytes | None = None,
-                jpegheader: bytes | None = None,
-                _fullsize: bool = False,
-            ) -> tuple[
-                NDArray[Any] | None,
-                tuple[int, int, int, int, int],
-                tuple[int, int, int, int],
-            ]:
-                # return decoded segment, its shape, and indices in image
-                segmentindex, shape = indices(index)
-                if data is None:
-                    if _fullsize:
-                        shape = pad_none(shape)
-                    return data, segmentindex, shape
-                data_array: NDArray[Any] = imagecodecs.jpeg_decode(
-                    data,
-                    bitspersample=self.bitspersample,
-                    tables=jpegtables,
-                    header=jpegheader,
-                    colorspace=colorspace,
-                    outcolorspace=outcolorspace,
-                    shape=shape[1:3],
-                )
-                data_array = reshape(data_array, segmentindex, shape)
-                if _fullsize:
-                    data_array, shape = pad(data_array, shape)
-                return data_array, segmentindex, shape
-
-            return cache(decode_jpeg)
-
-        if self.compression in {65000, 65001, 65002}:
-            # EER decoder requires shape and extra args
-
-            if self.compression == 65002:
-                rlebits = int(self.tags.valueof(65007, 7))
-                horzbits = int(self.tags.valueof(65008, 2))
-                vertbits = int(self.tags.valueof(65009, 2))
-            elif self.compression == 65001:
-                rlebits = 7
-                horzbits = 2
-                vertbits = 2
-            else:
-                rlebits = 8
-                horzbits = 2
-                vertbits = 2
-
-            def decode_eer(
-                data: bytes | None,
-                index: int,
-                *,
-                jpegtables: bytes | None = None,
-                jpegheader: bytes | None = None,
-                _fullsize: bool = False,
-            ) -> tuple[
-                NDArray[Any] | None,
-                tuple[int, int, int, int, int],
-                tuple[int, int, int, int],
-            ]:
-                # return decoded eer segment, its shape, and indices in image
-                segmentindex, shape = indices(index)
-                if data is None:
-                    if _fullsize:
-                        shape = pad_none(shape)
-                    return data, segmentindex, shape
-                data_array = decompress(
-                    data,
-                    shape=shape[1:3],
-                    rlebits=rlebits,
-                    horzbits=horzbits,
-                    vertbits=vertbits,
-                    superres=False,
-                )  # type: ignore[call-arg, misc]
-                return data_array.reshape(shape), segmentindex, shape
-
-            return cache(decode_eer)
-
-        if self.compression == 48124:
-            # Jetraw requires pre-allocated output buffer
-
-            def decode_jetraw(
-                data: bytes | None,
-                index: int,
-                *,
-                jpegtables: bytes | None = None,
-                jpegheader: bytes | None = None,
-                _fullsize: bool = False,
-            ) -> tuple[
-                NDArray[Any] | None,
-                tuple[int, int, int, int, int],
-                tuple[int, int, int, int],
-            ]:
-                # return decoded segment, its shape, and indices in image
-                segmentindex, shape = indices(index)
-                if data is None:
-                    if _fullsize:
-                        shape = pad_none(shape)
-                    return data, segmentindex, shape
-                data_array = numpy.zeros(shape, numpy.uint16)
-                decompress(data, out=data_array)  # type: ignore[misc]
-                return data_array.reshape(shape), segmentindex, shape
-
-            return cache(decode_jetraw)
-
-        if self.compression in TIFF.IMAGE_COMPRESSIONS:
-            # presume codecs always return correct dtype, native byte order...
-            if self.fillorder == 2:
-                logger().debug(
-                    f'{self!r} '
-                    f'disabling LSB2MSB for compression {self.compression}'
-                )
-            if unpredict:
-                logger().debug(
-                    f'{self!r} '
-                    f'disabling predictor for compression {self.compression}'
-                )
-
-            def decode_image(
-                data: bytes | None,
-                index: int,
-                *,
-                jpegtables: bytes | None = None,
-                jpegheader: bytes | None = None,
-                _fullsize: bool = False,
-            ) -> tuple[
-                NDArray[Any] | None,
-                tuple[int, int, int, int, int],
-                tuple[int, int, int, int],
-            ]:
-                # return decoded segment, its shape, and indices in image
-                segmentindex, shape = indices(index)
-                if data is None:
-                    if _fullsize:
-                        shape = pad_none(shape)
-                    return data, segmentindex, shape
-                data_array: NDArray[Any]
-                data_array = decompress(data)  # type: ignore[misc]
-                # del data
-                data_array = reshape(data_array, segmentindex, shape)
-                if _fullsize:
-                    data_array, shape = pad(data_array, shape)
-                return data_array, segmentindex, shape
-
-            return cache(decode_image)
-
-        dtype = numpy.dtype(self.parent.byteorder + self._dtype.char)
-
-        if self.sampleformat == 5:
-            # complex integer
-            if unpredict is not None:
-                raise NotImplementedError(
-                    'unpredicting complex integers not supported'
-                )
-
-            itype = numpy.dtype(
-                f'{self.parent.byteorder}i{self.bitspersample // 16}'
-            )
-            ftype = numpy.dtype(
-                f'{self.parent.byteorder}f{dtype.itemsize // 2}'
-            )
-
-            def unpack(data: bytes) -> NDArray[Any]:
-                # return complex integer as numpy.complex
-                return numpy.frombuffer(data, itype).astype(ftype).view(dtype)
-
-        elif self.bitspersample in {8, 16, 32, 64, 128}:
-            # regular data types
-
-            if (self.bitspersample * stwidth * samples) % 8:
-                raise ValueError('data and sample size mismatch')
-            if self.predictor in {3, 34894, 34895}:  # PREDICTOR.FLOATINGPOINT
-                # floating-point horizontal differencing decoder needs
-                # raw byte order
-                dtype = numpy.dtype(self._dtype.char)
-
-            def unpack(data: bytes) -> NDArray[Any]:
-                # return numpy array from buffer
-                try:
-                    # read only numpy array
-                    return numpy.frombuffer(data, dtype)
-                except ValueError:
-                    # for example, LZW strips may be missing EOI
-                    bps = self.bitspersample // 8
-                    size = (len(data) // bps) * bps
-                    return numpy.frombuffer(data[:size], dtype)
-
-        elif isinstance(self.bitspersample, tuple):
-            # for example, RGB 565
-            def unpack(data: bytes) -> NDArray[Any]:
-                # return numpy array from packed integers
-                return unpack_rgb(data, dtype, self.bitspersample)
-
-        elif self.bitspersample == 24 and dtype.char == 'f':
-            # float24
-            if unpredict is not None:
-                # floatpred_decode requires numpy.float24, which does not exist
-                raise NotImplementedError('unpredicting float24 not supported')
-
-            def unpack(data: bytes) -> NDArray[Any]:
-                # return numpy.float32 array from float24
-                return imagecodecs.float24_decode(
-                    data, byteorder=self.parent.byteorder
-                )
-
-        else:
-            # bilevel and packed integers
-            def unpack(data: bytes) -> NDArray[Any]:
-                # return NumPy array from packed integers
-                return imagecodecs.packints_decode(
-                    data, dtype, self.bitspersample, runlen=stwidth * samples
-                )
-
-        def decode_other(
-            data: bytes | None,
-            index: int,
-            *,
-            jpegtables: bytes | None = None,
-            jpegheader: bytes | None = None,
-            _fullsize: bool = False,
-        ) -> tuple[
-            NDArray[Any] | None,
-            tuple[int, int, int, int, int],
-            tuple[int, int, int, int],
-        ]:
-            # return decoded segment, its shape, and indices in image
-            segmentindex, shape = indices(index)
-            if data is None:
-                if _fullsize:
-                    shape = pad_none(shape)
-                return data, segmentindex, shape
-            if self.fillorder == 2:
-                data = imagecodecs.bitorder_decode(data)
-            if decompress is not None:
-                # TODO: calculate correct size for packed integers
-                size = shape[0] * shape[1] * shape[2] * shape[3]
-                data = decompress(data, out=size * dtype.itemsize)
-            data_array = unpack(data)  # type: ignore[arg-type]
-            # del data
-            data_array = reshape(data_array, segmentindex, shape)
-            data_array = data_array.astype('=' + dtype.char, copy=False)
-            if unpredict is not None:
-                # unpredict is faster with native byte order
-                data_array = unpredict(data_array, axis=-2, out=data_array)
-            if _fullsize:
-                data_array, shape = pad(data_array, shape)
-            return data_array, segmentindex, shape
-
-        return cache(decode_other)
+        
+        # Create the decoder using the factory method
+        decoder = TiffDecoder.create(self)
+        
+        # Cache the decoder
+        self.parent._parent._decoders[self.hash] = decoder
+        
+        return decoder
 
     def segments(
         self,
@@ -1810,15 +830,15 @@ cdef class TiffPage:
             decodeargs['jpegtables'] = self.jpegtables
             decodeargs['jpegheader'] = keyframe.jpegheader
 
+        # Get the decoder instance from keyframe
+        decoder = keyframe.decode
+        
         if func is None:
-
-            def decode(args, decodeargs=decodeargs, decode=keyframe.decode):
-                return decode(*args, **decodeargs)
-
+            # Direct decoding with decoder instance
+            process = lambda args: decoder(*args, **decodeargs)
         else:
-
-            def decode(args, decodeargs=decodeargs, decode=keyframe.decode):
-                return func(decode(*args, **decodeargs))
+            # Apply function to decoded result
+            process = lambda args: func(decoder(*args, **decodeargs))
 
         if maxworkers is None or maxworkers < 1:
             maxworkers = keyframe.maxworkers
@@ -1826,12 +846,11 @@ cdef class TiffPage:
             for segment in fh.read_segments(
                 self.dataoffsets,
                 self.databytecounts,
-                #lock=lock,
                 sort=sort,
                 buffersize=-1 if buffersize is None else buffersize,
                 flat=True,
             ):
-                yield decode(segment)
+                yield process(segment)
         else:
             # reduce memory overhead by processing chunks of up to
             # buffersize of segments because ThreadPoolExecutor.map is not
@@ -1840,12 +859,11 @@ cdef class TiffPage:
                 for segments in fh.read_segments(
                     self.dataoffsets,
                     self.databytecounts,
-                    #lock=lock,
                     sort=sort,
                     buffersize=-1 if buffersize is None else buffersize,
                     flat=False,
                 ):
-                    yield from executor.map(decode, segments)
+                    yield from executor.map(process, segments)
 
     def asarray(
         self,
@@ -1937,7 +955,7 @@ cdef class TiffPage:
 
         elif keyframe.is_contiguous:
             # read contiguous bytes to array
-            if keyframe.is_subsampled:
+            if keyframe.is_subsampled():
                 raise NotImplementedError('chroma subsampling not supported')
             if out is not None:
                 out = create_output(out, keyframe.shaped, keyframe._dtype)
@@ -1970,7 +988,7 @@ cdef class TiffPage:
             keyframe.jpegheader is not None
             and keyframe is self
             and 273 in self.tags  # striped ...
-            and self.is_tiled  # but reported as tiled
+            and self.is_tiled()  # but reported as tiled
             # TODO: imagecodecs can decode larger JPEG
             and self.imagewidth <= 65500
             and self.imagelength <= 65500
@@ -2357,7 +1375,7 @@ cdef class TiffPage:
     @property
     def tile(self) -> tuple[int, ...] | None:
         """Tile depth, length, and width."""
-        if not self.is_tiled:
+        if not self.is_tiled():
             return None
         if self.tiledepth > 1:
             return (self.tiledepth, self.tilelength, self.tilewidth)
@@ -2369,7 +1387,7 @@ cdef class TiffPage:
         shape: list[int] = []
         if self.tiledepth > 1:
             shape.append(self.tiledepth)
-        if self.is_tiled:
+        if self.is_tiled():
             shape.extend((self.tilelength, self.tilewidth))
         else:
             shape.extend((self.rowsperstrip, self.imagewidth))
@@ -2383,7 +1401,7 @@ cdef class TiffPage:
         shape: list[int] = []
         if self.planarconfig == 2 and self.samplesperpixel > 1:
             shape.append(self.samplesperpixel)
-        if self.is_tiled:
+        if self.is_tiled():
             if self.imagedepth > 1:
                 shape.append(
                     (self.imagedepth + self.tiledepth - 1) // self.tiledepth
@@ -2405,8 +1423,7 @@ cdef class TiffPage:
             shape.append(1)
         return tuple(shape)
 
-    @property#@cached_property
-    def hash(self) -> int:
+    cpdef int hash(self):
         """Checksum to identify pages in same series.
 
         Pages with the same hash can use the same decode function.
@@ -2533,7 +1550,7 @@ cdef class TiffPage:
             self.is_contiguous
             and self.fillorder == 1
             and self.predictor == 1
-            and not self.is_subsampled
+            and not self.is_subsampled()
         )
 
     @property#@cached_property
@@ -2590,7 +1607,7 @@ cdef class TiffPage:
                         PHOTOMETRIC(self.photometric).name,
                         'REDUCED' if self.is_reduced else '',
                         'MASK' if self.is_mask else '',
-                        'TILED' if self.is_tiled else '',
+                        'TILED' if self.is_tiled() else '',
                         tostr('compression'),
                         tostr('planarconfig'),
                         tostr('predictor'),
@@ -2889,8 +1906,7 @@ cdef class TiffPage:
                 return description
         return None
 
-    @property#@cached_property
-    def is_jfif(self) -> bool:
+    cpdef bint is_jfif(self):
         """JPEG compressed segments contain JFIF metadata."""
         if (
             self.compression not in {6, 7, 34892, 33007}
@@ -2940,13 +1956,11 @@ cdef class TiffPage:
         """Page is part of Mixed Raster Content."""
         return bool(self.subfiletype & 0b1000)
 
-    @property
-    def is_tiled(self) -> bool:
+    cpdef bint is_tiled(self):
         """Page contains tiled image."""
         return self.tilewidth > 0  # return 322 in self.tags  # TileWidth
 
-    @property
-    def is_subsampled(self) -> bool:
+    cpdef bint is_subsampled(self):
         """Page contains chroma subsampled image."""
         if self.subsampling is not None:
             return self.subsampling != (1, 1)
