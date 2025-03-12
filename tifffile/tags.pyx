@@ -13,7 +13,7 @@ from libcpp.vector cimport vector
 from libcpp.unordered_map cimport unordered_multimap as cpp_multimap
 from libcpp.utility cimport pair
 from .files cimport FileHandle
-from .format cimport TiffFormat, ByteOrder
+from .format cimport TiffFormat, ByteOrder, TagHeader
 from .names cimport get_tag_names
 from .types cimport DATATYPE
 from .utils cimport bytes2str_stripnull, bytes2str_stripnull_last
@@ -1638,6 +1638,77 @@ cdef class TiffTag:
         return tag
 
     @staticmethod
+    cdef TiffTag fromheader(FileHandle fh, TiffFormat tiff_format, TagHeader header):
+        """Return TiffTag instance from parsed tag header.
+
+        Parameters:
+            fh:
+                FileHandler instance tag is associated with.
+            tiff_format:
+                TiffFormat instance describing the file format.
+            header:
+                Parsed TagHeader structure containing tag information.
+
+        Returns:
+            TiffTag instance with properties set from header.
+        """
+        cdef int64_t i, valuesize
+        cdef TiffTag tag = TiffTag.__new__(TiffTag)
+        cdef object value = None
+        tag.fh = fh
+        tag.tiff_format = tiff_format
+        tag.offset = 0  # Original file offset not preserved in header
+        tag.code = header.code
+        tag.datatype = header.datatype
+        tag.count = header.count
+        tag.valueoffset = header.as_offset
+
+        # Check if this is an inlined value (fits within the tag's value field)
+        try:
+            valuesize = tag.count * get_data_format_size(tag.datatype)
+            if valuesize <= tiff_format.tagoffsetthreshold and not readable_tag(tag.code):
+                # For inlined values, we can use the pre-parsed values directly
+                values = []
+                for i in range(tag.count):
+                    # Use the pre-parsed value
+                    if tag.datatype in (1, 2, 3, 4, 6, 7, 8, 9, 13, 16, 17, 18): #integer formats
+                        value = header.as_values[i].i
+                    elif tag.datatype in (11, 12):  # FLOAT, DOUBLE
+                        value = header.as_values[i].d
+                    elif tag.datatype in (5, 10):  # RATIONAL, SRATIONAL
+                        value = (header.as_values[2*i].i, header.as_values[2*i+1].i)
+                    else:
+                        raise ValueError(f"Unknown datatype {tag.datatype}")
+                    values.append(value)
+
+                # Process the value
+                if tag.count > 1 or tag_is_tuple(header.code):
+                    if tag.count > 1:
+                        value = tuple(values)
+                    else:
+                        value = (values[0],)
+                else:
+                    value = values[0]
+                if tag.datatype == 2:
+                    # convert to bytes
+                    value = bytes(values) # unsure if this is correct
+                value = TiffTag._process_value(value, tag.code, tag.datatype, 0)
+        except Exception as e:
+            import traceback
+            print("Error: ", e)
+            print(traceback.format_exc())
+            print("Code: ", tag.code)
+            print("Datatype: ", tag.datatype)
+            print("Count: ", tag.count)
+            print("Valueoffset: ", tag.valueoffset)
+            print(value)
+            return None
+        
+        tag._value = value  # Value will be lazily loaded when requested for non inlined values
+        return tag
+    
+
+    @staticmethod
     cdef object _read_value(
         FileHandle fh,
         TiffFormat tiff_format,
@@ -1687,6 +1758,7 @@ cdef class TiffTag:
                     count,
                     offsetsize
                 )
+                #print("read7: ", value)
             except Exception as exc:
                 logger().warning(
                     f'<tifffile.TiffTag {code} @{offset}> raised {exc!r:.128}'
@@ -1697,6 +1769,7 @@ cdef class TiffTag:
         if datatype in [1, 2, 7]:
             # BYTES, ASCII, UNDEFINED
             value = fh.read_at(valueoffset, valuesize)
+            #print("read8: ", value)
             if len(value) != valuesize:
                 logger().warning(
                     f'<tifffile.TiffTag {code} @{offset}> '
@@ -1705,6 +1778,7 @@ cdef class TiffTag:
         elif not(tag_is_tuple(code)) and count > 1024:
             fh.seek(valueoffset)
             value = read_numpy(fh, byteorder, datatype, count, offsetsize)
+            #print("read9: ", value)
         else:
             data = fh.read_at(valueoffset, valuesize)
             data_ptr = data
@@ -1719,6 +1793,7 @@ cdef class TiffTag:
                 for i in range(count):
                     result.append(interprete_data_format(datatype, data_ptr + i * structsize, byteorder))
                 value = tuple(result)
+            #print("read10: ", value)
             return value
 
     @staticmethod
@@ -1768,6 +1843,7 @@ cdef class TiffTag:
             #     f'_read_value {self.code} {TIFF.TAGS.get(self.code)} '
             #     f'{self.datatype}[{self.count}] @{self.valueoffset} '
             # )
+            #print("resolve: ", self.code)
             value = TiffTag._read_value(
                 self.fh,
                 self.tiff_format,
@@ -1797,27 +1873,9 @@ cdef class TiffTag:
         self.value_set(value)
 
     @property
-    def dtype_name(self) -> str:
-        """Name of data type of tag value."""
-        try:
-            return self.dtype.name  # type: ignore[attr-defined]
-        except AttributeError:
-            return f'TYPE{self.dtype}'
-
-    @property
     def name(self) -> str:
         """Name of tag from :py:attr:`_TIFF.TAGS` registry."""
         return TIFF.TAGS.get(self.code, str(self.code))
-
-    @property
-    def dataformat(self) -> str:
-        """Data type as `struct.pack` format."""
-        return TIFF.DATA_FORMATS[self.dtype]
-
-    @property
-    def valuebytecount(self) -> int:
-        """Number of bytes of tag value in file."""
-        return self.count * struct.calcsize(TIFF.DATA_FORMATS[self.dtype])
 
 @cython.final
 cdef class TiffTags:
@@ -1828,7 +1886,6 @@ cdef class TiffTags:
     - values are instances of :py:class:`TiffTag`.
     - keys are :py:attr:`TiffTag.code` (int).
     - multiple values can be stored per key.
-    - can be indexed by :py:attr:`TiffTag.name` (`str`), slower than by key.
     - `iter()` returns values instead of keys.
     - `values()` and `items()` contain all values sorted by offset.
     - `len()` returns number of all values.
@@ -1837,10 +1894,11 @@ cdef class TiffTags:
 
     """
 
-    def __cinit__(self):
+    def __cinit__(self, FileHandle fh, TiffFormat tiff):
         self._tags = []  # List to store all tags
         self._code_indices = cpp_multimap[int64_t, int]()  # Code -> indices multimap
-        self._tag_count = 0  # Count of non-None tags
+        self.fh = fh
+        self.tiff = tiff
 
     cdef bint contains_code(self, int64_t code) noexcept nogil:
         """Check if code is in map."""
@@ -1849,75 +1907,105 @@ cdef class TiffTags:
     def contains(self, object code):
         return self.contains_code(code)
 
-    cdef vector[int] _get_indices(self, int64_t code) nogil:
-        """Get list of indices for a code."""
-        cdef vector[int] result = vector[int]()
-        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] range
-        cdef cpp_multimap[int64_t, int].iterator it
-        
-        if self._code_indices.count(code) > 0:
-            range = self._code_indices.equal_range(code)
-            it = range.first
-            while it != range.second:
-                result.push_back(dereference(it).second)
-                postincrement(it)
-        
-        return result
-                
-    cpdef void add(self, TiffTag tag):
-        """Add tag."""
-        cdef int64_t code = tag.code
-        cdef int64_t index = len(self._tags)
-        
-        # Add tag to list
-        self._tags.append(tag)
-        
-        # Add index to code's list
+    cdef int64_t _get_tag_value_as_int64(self, int index):
+        """Retrieve a tag value as an int64"""
+        # Check if header can directly be read as int64
+        cdef int64_t datatype = self._headers[index].datatype
+        cdef int64_t count = self._headers[index].count
+        if count == 1:
+            return self._headers[index].as_values[0].i
+        return self._get_tag_value_at(index)
+
+    cdef double _get_tag_value_as_double(self, int index):
+        """Retrieve a tag value as a double"""
+        # Check if header can directly be read as double
+        cdef int64_t datatype = self._headers[index].datatype
+        cdef int64_t count = self._headers[index].count
+        if count == 1:
+            return self._headers[index].as_values[0].d
+        return self._get_tag_value_at(index)
+
+    cdef object _get_tag_value_at(self, int index):
+        """Retrieve the tag value at the target index"""
+        if self._tags[index] is not None:
+            return self._tags[index].value_get()
+        # Create TiffTag instance
+        cdef TiffTag tag = TiffTag.fromheader(self.fh, self.tiff, self._headers[index])
+        self._tags[index] = tag
+        if tag is None:
+            return None
+        return tag.value_get()
+
+    cdef TiffTag _get_tag_at(self, int index):
+        """Retrieve the TiffTag at the target index"""
+        if self._tags[index] is not None:
+            return self._tags[index]
+        # Create TiffTag instance
+        cdef TiffTag tag = TiffTag.fromheader(self.fh, self.tiff, self._headers[index])
+        self._tags[index] = tag
+        return tag
+
+    cdef void load_tags(self, bytes data):
+        """
+        load the tags contained in data.
+        """
+
+        cdef vector[TagHeader] headers = vector[TagHeader]()
+        cdef TagHeader header
+        cdef unsigned char *data_ptr = <unsigned char *>data
+        cdef int64_t data_len = len(data)
         cdef pair[int64_t, int] element
-        element.first = code
-        element.second = index
-        self._code_indices.insert(element)
-        
-        self._tag_count += 1
+        with nogil:
+            self.tiff.parse_tag_headers(headers, data_ptr, data_len)
+
+        assert not self.tiff.is_ndpi() # NDPI format is not supported yet
+
+        # process the headers
+        for header in headers:
+            element.first = header.code
+            element.second = len(self._tags)
+            self._code_indices.insert(element)
+            self._tags.append(None) # Lazy loading
+            self._headers.push_back(header)
+
 
     cpdef list keys(self):
         """Return codes of all tags."""
         cdef list result = []
-        cdef TiffTag tag
-        
-        for tag in self._tags:
-            if tag is not None:
-                result.append(tag.code)
+        cdef TagHeader header
+
+        for header in self._headers:
+            result.append(header.code)
                 
         return result
 
     cpdef list values(self):
         """Return all tags in order they are stored in file."""
         cdef list result = []
-        cdef TiffTag tag
+        cdef int index
         
-        for tag in self._tags:
-            if tag is not None:
-                result.append(tag)
+        for index in range(<int>self._headers.size()):
+            result.append(self._get_tag_value_at(index))
                 
         return result
 
     cpdef list items(self):
-        """Return all (code, tag) pairs in order tags are stored in file."""
+        """Return all (code, tag) pairs in order tags as stored in file."""
         cdef list result = []
         cdef TiffTag tag
-        
-        for tag in self._tags:
-            if tag is not None:
-                result.append((tag.code, tag))
+        cdef int index
+
+        for index in range(<int>self._headers.size()):
+            tag = self._get_tag_at(index)
+            result.append((tag.code, tag))
                 
         return result
 
     cpdef object valueof(
         self,
         int64_t code,
-        object default = None,
-        int64_t index = -1,
+        object default=None,
+        int64_t index=0,
     ):
         """Return value of tag by code if exists, else default.
 
@@ -1932,19 +2020,143 @@ cdef class TiffTags:
                 The default is the first tag.
 
         """
-        cdef TiffTag tag = self.get(code, default=None, index=index)
-        if tag is None:
-            return default
-        try:
-            return tag.value_get()
-        except TiffFileError:
-            return default  # corrupted tag
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef TiffTag tag
+        cdef int idx
+        cdef int i
+
+        if index == 0:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
+                return default
+            idx = dereference(it).second
+            return self._get_tag_value_at(idx)
+        else:
+            if self._code_indices.count(code) == 0:
+                return default
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return default
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._get_tag_value_at(idx)
+
+    cdef int64_t valueof_int(
+        self,
+        int64_t code,
+        int64_t default,
+        int64_t index):
+        """Return int value of tag by code if exists, else default.
+
+        Parameters:
+            code:
+                Code of tag to return.
+            default:
+                Another value to return if specified tag is corrupted or
+                not found.
+            index:
+                Specifies tag in case of multiple tags with identical code.
+                The default is the first tag.
+
+        """
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef TiffTag tag
+        cdef int idx
+        cdef int i
+
+        if index == 0:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
+                return default
+            idx = dereference(it).second
+            return self._get_tag_value_as_int64(idx)
+        else:
+            if self._code_indices.count(code) == 0:
+                return default
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return default
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._get_tag_value_as_int64(idx)
+
+    cdef double valueof_double(
+        self,
+        int64_t code,
+        double default,
+        int64_t index):
+        """Return double value of tag by code if exists, else default.
+
+        Parameters:
+            code:
+                Code of tag to return.
+            default:
+                Another value to return if specified tag is corrupted or
+                not found.
+            index:
+                Specifies tag in case of multiple tags with identical code.
+                The default is the first tag.
+
+        """
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef TiffTag tag
+        cdef int idx
+        cdef int i
+
+        if index == 0:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
+                return default
+            idx = dereference(it).second
+            return self._get_tag_value_as_double(idx)
+        else:
+            if self._code_indices.count(code) == 0:
+                return default
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return default
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._get_tag_value_as_double(idx)
 
     cpdef TiffTag get(
         self,
         int64_t code,
-        TiffTag default = None,
-        int64_t index = -1):
+        TiffTag default=None,
+        int64_t index=0):
         """Return tag by code if exists, else default.
 
         Parameters:
@@ -1964,13 +2176,13 @@ cdef class TiffTags:
         cdef int idx
         cdef int i
 
-        if index == -1:  # Most common case: get first tag
+        if index == 0:  # Most common case: get first tag
             # Find first non-None tag
             it = self._code_indices.find(code)
             if it == self._code_indices.end():
                 return default
             idx = dereference(it).second
-            return self._tags[idx]
+            return self._get_tag_at(idx)
         else:
             if self._code_indices.count(code) == 0:
                 return default
@@ -1988,90 +2200,41 @@ cdef class TiffTags:
                 
             # Get the tag at the requested index
             idx = dereference(it).second
-            return self._tags[idx]
+            return self._get_tag_at(idx)
 
-    cpdef object getall(
-        self,
-        int64_t code,
-        object default = None,
-    ):
-        """Return list of all tags by code if exists, else default.
+    cdef int64_t get_count(self, int64_t code, int64_t index) noexcept nogil:
+        """Retrieve the header count for target code. 0 if not present"""
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef int idx
+        cdef int i
 
-        Parameters:
-            code:
-                Code of tags to return.
-            default:
-                Value to return if no tags are found.
-
-        """
-        cdef list result = []
-        cdef vector[int] indices
-        cdef int64_t i, idx
-        cdef TiffTag tag
-        
-        if not self.contains_code(code):
-            return default
-                
-        indices = self._get_indices(code)
-        for i in range(<int64_t>indices.size()):
-            idx = indices[i]
-            tag = self._tags[idx]
-            if tag is not None:
-                result.append(tag)
-                    
-        return result if result else default
-
-    def __getitem__(self, object key):
-        """Return first tag by code. Raise KeyError if not found."""
-        cdef TiffTag tag = self.get(key)
-        if tag is None:
-            raise KeyError(key)
-        return tag
-
-    def __setitem__(self, int64_t code, TiffTag tag):
-        """Add tag."""
-        assert tag.code == code
-        self.add(tag)
-
-    def __delitem__(self, int64_t code) -> None:
-        """Delete all tags by code."""
-        cdef bint found = False
-        cdef vector[int] indices
-        cdef int64_t i, idx
-        
-        if not self.contains_code(code):
-            raise KeyError(code)
-                
-        indices = self._get_indices(code)
-        for i in range(<int64_t>indices.size()):
-            idx = indices[i]
-            if self._tags[idx] is not None:
-                self._tags[idx] = None
-                found = True
-                self._tag_count -= 1
-                    
-        # Remove code from the multimap
-        self._code_indices.erase(code)
-            
-        if found:
-            return
+        if index == 0:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
+                return 0
+            idx = dereference(it).second
+            return self._headers[idx].count
         else:
-            raise KeyError(code)
+            if self._code_indices.count(code) == 0:
+                return 0
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return 0
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._headers[idx].count
 
-    def __contains__(self, object item):
-        """Return if tag is in map."""
-        print(item, self.contains_code(item))
-        return self.contains_code(item)
-
-    def __iter__(self):
-        """Return iterator over all tags."""
-        for tag in self._tags:
-            if tag is not None:
-                yield tag
-
-    def __len__(self):
-        """Return number of tags."""
-        return self._tag_count
 
 
 @cython.final

@@ -26,22 +26,22 @@ cdef class TiffPage:
     cdef dict _cache
     
     # Page properties
-    cdef public int subfiletype
-    cdef public int imagewidth
-    cdef public int imagelength
-    cdef public int imagedepth
-    cdef public int tilewidth
-    cdef public int tilelength 
-    cdef public int tiledepth
-    cdef public int samplesperpixel
-    cdef public int bitspersample
-    cdef public int sampleformat
-    cdef public int rowsperstrip
-    cdef public int compression
-    cdef public int planarconfig
-    cdef public int fillorder
-    cdef public int photometric
-    cdef public int predictor
+    cdef public int64_t subfiletype
+    cdef public int64_t imagewidth
+    cdef public int64_t imagelength
+    cdef public int64_t imagedepth
+    cdef public int64_t tilewidth
+    cdef public int64_t tilelength 
+    cdef public int64_t tiledepth
+    cdef public int64_t samplesperpixel
+    cdef public int64_t bitspersample
+    cdef public int64_t sampleformat
+    cdef public int64_t rowsperstrip
+    cdef public int64_t compression
+    cdef public int64_t planarconfig
+    cdef public int64_t fillorder
+    cdef public int64_t photometric
+    cdef public int64_t predictor
     cdef public tuple extrasamples
     cdef public tuple subsampling
     cdef public tuple subifds
@@ -67,14 +67,14 @@ cdef class TiffPage:
     
     # Property declarations
     #cpdef TiffPage keyframe(self)
-    #cpdef int index(self)
+    #cpdef int64_t index(self)
     cpdef bint is_contiguous(self)
     cpdef bint is_final(self)
     cpdef bint is_memmappable(self)
     cpdef bint is_tiled(self)
     cpdef bint is_subsampled(self)
     cpdef bint is_jfif(self)
-    cpdef int hash(self)
+    cpdef int64_t hash(self)
     cpdef bint is_ndpi(self)
     cpdef bint is_philips(self)
     cpdef bint is_eer(self)
@@ -153,37 +153,37 @@ cdef public TiffTags tags
     cdef tuple _index#: tuple[int, ...]  # index of page in IFD tree
 
     # default properties; might be updated from tags
-    cdef public int subfiletype
+    cdef public int64_t subfiletype
     """:py:class:`FILETYPE` kind of image."""
-    cdef public int imagewidth
+    cdef public int64_t imagewidth
     """Number of columns (pixels per row) in image."""
-    cdef public int imagelength
+    cdef public int64_t imagelength
     """Number of rows in image."""
-    cdef public int imagedepth
+    cdef public int64_t imagedepth
     """Number of Z slices in image."""
-    cdef public int tilewidth
+    cdef public int64_t tilewidth
     """Number of columns in each tile."""
-    cdef public int tilelength
+    cdef public int64_t tilelength
     """Number of rows in each tile."""
-    cdef public int tiledepth
+    cdef public int64_t tiledepth
     """Number of Z slices in each tile."""
-    cdef public int samplesperpixel
+    cdef public int64_t samplesperpixel
     """Number of components per pixel."""
-    cdef public int bitspersample
+    cdef public int64_t bitspersample
     """Number of bits per pixel component."""
-    cdef public int sampleformat
+    cdef public int64_t sampleformat
     """:py:class:`SAMPLEFORMAT` type of pixel components."""
-    cdef public int rowsperstrip
+    cdef public int64_t rowsperstrip
     """Number of rows per strip."""
-    cdef public int compression
+    cdef public int64_t compression
     """:py:class:`COMPRESSION` scheme used on image data."""
-    cdef public int planarconfig
+    cdef public int64_t planarconfig
     """:py:class:`PLANARCONFIG` type of storage of components in pixel."""
-    cdef public int fillorder
+    cdef public int64_t fillorder
     """Logical order of bits within byte of image data."""
-    cdef public int photometric
+    cdef public int64_t photometric
     """:py:class:`PHOTOMETRIC` color space of image."""
-    cdef public int predictor
+    cdef public int64_t predictor
     """:py:class:`PREDICTOR` applied to image data before compression."""
     cdef public tuple extrasamples # tuple[int, ...]
     """:py:class:`EXTRASAMPLE` interpretation of extra components in pixel."""
@@ -201,7 +201,7 @@ cdef public TiffTags tags
     """Subject of image."""
     cdef public str description1
     """Value of second ImageDescription tag."""
-    cdef public float nodata # int | float
+    cdef public float nodata # int64_t | float
     """Value used for missing data. The value of the GDAL_NODATA tag or 0."""
 
 '''

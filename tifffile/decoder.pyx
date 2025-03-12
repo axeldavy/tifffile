@@ -610,7 +610,7 @@ cdef class TiffDecoder:
 
         # Check if sample formats match
         if page.tags.get(339) is not None:
-            tag = page.tags[339]  # SampleFormat
+            tag = page.tags.get(339)  # SampleFormat
             if tag.count != 1 and any(i - tag.value[0] for i in tag.value_get()):
                 return TiffDecoderError.initialize(
                     page, f'sample formats do not match {tag.value}'
@@ -639,7 +639,7 @@ cdef class TiffDecoder:
                 logger().debug(f'{page!r} disabling LSB2MSB for JPEG')
             if unpredict:
                 logger().debug(f'{page!r} disabling predictor for JPEG')
-            if 28672 in page.tags:  # SonyRawFileType
+            if page.tags.contains_code(28672):  # SonyRawFileType
                 logger().warning(
                     f'{page!r} SonyRawFileType might need additional '
                     'unpacking (see issue #95)'

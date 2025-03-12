@@ -1,13 +1,28 @@
 #distutils: language=c++
 
-from libc.stdint cimport int64_t, uint64_t
-
+from libc.stdint cimport uint8_t, int8_t, int16_t, uint16_t, int32_t, uint32_t, int64_t, uint64_t
+from libcpp.vector cimport vector
 
 
 """TIFF byte order."""
 cdef enum ByteOrder:
     II # Little-endian.
     MM # Big-endian.
+
+
+cdef union TagValueUnion:
+    int64_t i
+    double d
+
+
+cdef struct TagHeader:
+    int16_t code
+    int16_t datatype
+    int32_t count
+    uint64_t value        # Raw uninterpreted value from tag
+    uint64_t as_offset    # Value interpreted as an offset
+    TagValueUnion as_values[8]  # Array of values as int64_t or double
+
 
 cdef class TiffFormat:
     """TIFF format properties."""
@@ -51,28 +66,20 @@ cdef class TiffFormat:
     cpdef bint is_bigtiff(self)
     cpdef bint is_ndpi(self)
 
-    cpdef tuple parse_tag_header(self, bytes header)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil
     """Parse TIFF tag header and return code, dtype, count, and value."""
-    
-    cpdef uint64_t interprete_offset(self, bytes value)
-    """Convert bytes value from tag header to offset."""
 
 cdef class TiffFormatClassicLE(TiffFormat):
-    cpdef tuple parse_tag_header(self, bytes header)
-    cpdef uint64_t interprete_offset(self, bytes value)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil
 
 cdef class TiffFormatClassicBE(TiffFormat):
-    cpdef tuple parse_tag_header(self, bytes header)
-    cpdef uint64_t interprete_offset(self, bytes value)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil
 
 cdef class TiffFormatBigLE(TiffFormat):
-    cpdef tuple parse_tag_header(self, bytes header)
-    cpdef uint64_t interprete_offset(self, bytes value)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil
 
 cdef class TiffFormatBigBE(TiffFormat):
-    cpdef tuple parse_tag_header(self, bytes header)
-    cpdef uint64_t interprete_offset(self, bytes value)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil
 
 cdef class TiffFormatNDPI_LE(TiffFormat):
-    cpdef tuple parse_tag_header(self, bytes header)
-    cpdef uint64_t interprete_offset(self, bytes value)
+    cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil

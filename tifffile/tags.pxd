@@ -2,7 +2,7 @@
 
 from libc.stdint cimport int32_t, int64_t
 from .files cimport FileHandle
-from .format cimport TiffFormat
+from .format cimport TiffFormat, TagHeader
 from libcpp.unordered_map cimport unordered_multimap as cpp_multimap
 from libcpp.string cimport string as cpp_string
 from libcpp.vector cimport vector
@@ -55,6 +55,11 @@ cdef class TiffTag:
     )
 
     @staticmethod
+    cdef TiffTag fromheader(FileHandle fh,
+                            TiffFormat tiff_format,
+                            TagHeader header)
+
+    @staticmethod
     cdef object _read_value(
         FileHandle fh,
         TiffFormat tiff_format,
@@ -75,32 +80,46 @@ cdef class TiffTag:
 
 
 cdef class TiffTags:
-
-    cdef list _tags  # Store all tags in a list
+    cdef FileHandle fh
+    cdef TiffFormat tiff
+    cdef list _tags  # Store all tags in a list. None if not loaded into a TiffTag
+    cdef vector[TagHeader] _headers # headers for each tag
     cdef cpp_multimap[int64_t, int] _code_indices  # Maps code -> list indices
-    cdef int64_t _tag_count  # Count of non-None tags
     
     # Private methods
-    cdef vector[int] _get_indices(self, int64_t code) nogil
-
-    cpdef void add(self, TiffTag tag)
+    cdef int64_t _get_tag_value_as_int64(self, int index)
+    cdef double _get_tag_value_as_double(self, int index)
+    cdef object _get_tag_value_at(self, int index)
+    cdef TiffTag _get_tag_at(self, int index)
+    cdef void load_tags(self, bytes data)
     cpdef list keys(self)
-    cpdef list values(self)
     cpdef list items(self)
+    cpdef list values(self)
     cpdef object valueof(
         self,
-        int64_t key,
-        object default = ?,
-        int64_t index = ?)
+        int64_t code,
+        object default=?,
+        int64_t index=?,
+    )
+    cdef int64_t valueof_int(
+        self,
+        int64_t code,
+        int64_t default,
+        int64_t index)
+    cdef double valueof_double(
+        self,
+        int64_t code,
+        double default,
+        int64_t index)
     cpdef TiffTag get(
         self,
         int64_t code,
-        TiffTag default = ?,
-        int64_t index = ?)
-    cpdef object getall(
+        TiffTag default=?,
+        int64_t index=?)
+    cdef int64_t get_count(
         self,
         int64_t code,
-        object default = ?)
+        int64_t index) noexcept nogil
     cdef bint contains_code(self, int64_t code) noexcept nogil
 
 

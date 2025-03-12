@@ -358,8 +358,7 @@ cdef class TiffPage:
         self.shaped = (0, 0, 0, 0, 0)
         self.dtype = self._dtype = None
         self.axes = ''
-        self.tags = TiffTags()
-        cdef TiffTags tags = self.tags
+        self.tags = TiffTags(self.fh, self.tiff)
         self.dataoffsets = ()
         self.databytecounts = ()
         self._cache = {}
@@ -370,9 +369,6 @@ cdef class TiffPage:
 
         # Read IFD structure and tags
         self._read_ifd_structure()
-        
-        if not tags:
-            return  # found in FIBICS
             
         # Process common tags (dimensions, format, etc)
         self._process_common_tags()
@@ -389,9 +385,7 @@ cdef class TiffPage:
     cdef void _read_ifd_structure(self):
         """Read the IFD structure and tags from file."""
         cdef FileHandle fh = self.fh
-        cdef TiffFormat tiff = self.tiff
-        cdef TiffTags tags = self.tags
-        cdef bint is_little_endian = tiff.byteorder == ByteOrder.II
+        cdef bint is_little_endian = self.tiff.byteorder == ByteOrder.II
         
         # Record offset to this IFD
         self.offset = fh.tell()
@@ -403,7 +397,7 @@ cdef class TiffPage:
         cdef uint64_t tagno_large = 0
         
         try:
-            if tiff.tagnosize == 2:
+            if self.tiff.tagnosize == 2:
                 # Most common case (regular TIFF)
                 tagno_bytes = fh.read(2)
                 tagno_p = tagno_bytes
@@ -439,73 +433,17 @@ cdef class TiffPage:
         except Exception as exc:
             raise TiffFileError(f'corrupted tag list @{self.offset}') from exc
 
-        cdef int64_t tagoffset = self.offset + tiff.tagnosize  # fh.tell()
+        cdef int64_t tagoffset = self.offset + self.tiff.tagnosize  # fh.tell()
         cdef int64_t tagsize, tagsize_
-        tagsize = tagsize_ = tiff.tagsize
+        tagsize = tagsize_ = self.tiff.tagsize
 
         # Read all tag data at once
         cdef bytes data = fh.read(tagsize * tagno)
-        cdef bytes ext
         
         if len(data) != tagsize * tagno:
             raise TiffFileError('corrupted IFD structure')
 
-        cdef bytes new_data
-        cdef bytearray result
-        cdef uint8_t* result_ptr
-        cdef const uint8_t* data_ptr
-        cdef const uint8_t* ext_ptr
-        cdef int64_t i, j
-        # Special handling for NDPI format (Hamamatsu microscope scanner format)
-        if tiff.is_ndpi():
-            # patch offsets/values for 64-bit NDPI file
-            tagsize = 16
-            fh.seek(8, os.SEEK_CUR)
-            ext = fh.read(4 * tagno)  # high bits
-            
-            if len(ext) != 4 * tagno:
-                raise TiffFileError('corrupted NDPI IFD structure')
-                
-            # More efficient concatenation for NDPI format
-            new_data = b''
-            result = bytearray(tagno * 16)
-            result_ptr = result
-            data_ptr = data
-            ext_ptr = ext
-
-            for i in range(tagno):
-                # Copy 12 bytes from data
-                for j in range(12):
-                    result_ptr[i * 16 + j] = data_ptr[i * 12 + j]
-                # Copy 4 bytes from ext
-                for j in range(4):
-                    result_ptr[i * 16 + 12 + j] = ext_ptr[i * 4 + j]
-            
-            data = bytes(result)
-
-        # Parse individual tags from the IFD
-        cdef int64_t tagindex = -tagsize
-        cdef TiffTag tag
-        cdef bytes tagdata
-        
-        for i in range(tagno):
-            tagindex += tagsize
-            if tagindex + tagsize > len(data):
-                break  # Safety check
-            
-            tagdata = data[tagindex:tagindex + tagsize] if tagsize > 0 else b''
-            try:
-                tag = TiffTag.fromfile(
-                    self.fh,
-                    self.tiff,
-                    offset=tagoffset + i * tagsize_,
-                    header=tagdata,
-                    validate=True
-                )
-            except TiffFileError as exc:
-                logger().error(f'<TiffTag.fromfile> raised {exc!r:.128}')
-                continue
-            tags.add(tag)
+        self.tags.load_tags(data)
 
     cdef void _process_common_tags(self):
         """Process common TIFF tags and set page attributes."""
@@ -513,107 +451,45 @@ cdef class TiffPage:
         cdef object value
         
         # Process SubfileType
-        value = tags.valueof(254)
-        if value is not None:
-            self.subfiletype = value
+        self.subfiletype = tags.valueof_int(254, self.subfiletype, 0)
 
         # Process dimension tags
-        value = tags.valueof(256)  # ImageWidth
-        if value is not None:
-            self.imagewidth = value
-            
-        value = tags.valueof(257)  # ImageLength
-        if value is not None:
-            self.imagelength = value
-            
-        value = tags.valueof(32997)  # ImageDepth
-        if value is not None:
-            self.imagedepth = value
-            
+        self.imagewidth = tags.valueof_int(256, self.imagewidth, 0) # ImageWidth
+        self.imagelength = tags.valueof_int(257, self.imagelength, 0) # ImageLength
+        self.imagedepth = tags.valueof_int(32997, self.imagedepth, 0) # ImageDepth
+
         # Process tile-related tags
-        value = tags.valueof(322)  # TileWidth
-        if value is not None:
-            self.tilewidth = value
-            
-        value = tags.valueof(323)  # TileLength
-        if value is not None:
-            self.tilelength = value
-            
-        value = tags.valueof(32998)  # TileDepth
-        if value is not None:
-            self.tiledepth = value
-            
+        self.tilewidth = tags.valueof_int(322, self.tilewidth, 0) # TileWidth
+        self.tilelength = tags.valueof_int(323, self.tilelength, 0) # TileLength
+        self.tiledepth = tags.valueof_int(32998, self.tiledepth, 0) # TileDepth
+
         # Process sample-related tags
-        value = tags.valueof(277)  # SamplesPerPixel
-        if value is not None:
-            self.samplesperpixel = value
-            
-        value = tags.valueof(338)  # ExtraSamples
-        if value is not None:
-            self.extrasamples = value
-            
-        # Process image format tags
-        value = tags.valueof(259)  # Compression
-        if value is not None:
-            self.compression = value
-            
-        value = tags.valueof(262)  # Photometric
-        if value is not None:
-            self.photometric = value
-            
-        value = tags.valueof(284)  # PlanarConfig
-        if value is not None:
-            self.planarconfig = value
-            
-        value = tags.valueof(266)  # FillOrder
-        if value is not None:
-            self.fillorder = value
-            
-        value = tags.valueof(317)  # Predictor
-        if value is not None:
-            self.predictor = value
-            
-        value = tags.valueof(278)  # RowsPerStrip
-        if value is not None:
-            self.rowsperstrip = value
+        self.samplesperpixel = tags.valueof_int(277, self.samplesperpixel, 0) # SamplesPerPixel
+        self.compression = tags.valueof_int(259, self.compression, 0) # Compression
+        self.photometric = tags.valueof_int(262, self.photometric, 0) # Photometric
+        self.planarconfig = tags.valueof_int(284, self.planarconfig, 0) # PlanarConfig
+        self.fillorder = tags.valueof_int(266, self.fillorder, 0) # FillOrder
+        self.predictor = tags.valueof_int(317, self.predictor, 0) # Predictor
+        self.rowsperstrip = tags.valueof_int(278, self.rowsperstrip, 0) # RowsPerStrip
 
-        value = tags.valueof(530)  # YCbCrSubSampling
-        if value is not None:
-            self.subsampling = value
-            
-        value = tags.valueof(330)  # SubIFDs
-        if value is not None:
-            self.subifds = value
-            
-        value = tags.valueof(347)  # JPEGTables
-        if value is not None:
-            self.jpegtables = value
-        
-        # Process string-type tags with extra validation
-        value = tags.valueof(270)  # Description
-        if value is not None and isinstance(value, str):
-            self.description = value
-            
-        value = tags.valueof(305)  # Software
-        if value is not None and isinstance(value, str):
-            self.software = value
+        # These are tuples
+        self.extrasamples = tags.valueof(338, self.extrasamples, 0) # ExtraSamples
+        self.subsampling = tags.valueof(530, self.subsampling, 0) # YCbCrSubSampling
+        self.subifds = tags.valueof(330, self.subifds, 0) # SubIFDs
 
-        # Handle second description tag (if present)
-        value = tags.valueof(270, default=None, index=1)
-        if isinstance(value, str):
-            self.description1 = value
+        # Other tags
+        self.jpegtables = tags.valueof(347, self.jpegtables, 0) # JPEGTables
+        self.description = tags.valueof(270, self.description, 0) # Description
+        self.software = tags.valueof(305, self.software, 0) # Software
+        self.description1 = tags.valueof(270, self.description1, 1) # Description1
 
         # Process SubfileType (legacy tag)
         if self.subfiletype == 0:
-            value = tags.valueof(255)  # SubfileType
+            value = tags.valueof(255, None, 0) # SubfileType
             if value == 2:
-                self.subfiletype = 0b1  # reduced image
+                self.subfiletype = 0b1 # reduced image
             elif value == 3:
-                self.subfiletype = 0b10  # multi-page
-        #elif not isinstance(self.subfiletype, int):
-        #    # files created by IDEAS
-        #    logger().warning(f'{self!r} invalid {self.subfiletype=}')
-        #    self.subfiletype = 0
+                self.subfiletype = 0b10 # multi-page
 
     cdef void _process_special_format_tags(self):
         """Process tags specific to special file formats."""
@@ -648,7 +524,7 @@ cdef class TiffPage:
             try:
                 tag.value = imagej_metadata(
                     tag.value,
-                    tags[50838].value,  # IJMetadataByteCounts
+                    tags.valueof(50838),  # IJMetadataByteCounts
                     self.tiff.byteorder_str,
                 )
             except Exception as exc:
@@ -657,13 +533,12 @@ cdef class TiffPage:
                 )
 
         # BitsPerSample
-        value = tags.valueof(258)
-        if value is not None:
-            if self.bitspersample != 1:
-                pass  # bitspersample was set by ojpeg hack
-            elif tags.get(258).count == 1:
-                self.bitspersample = int(value)
+        if self.bitspersample == 1 and tags.contains_code(258): # not OJPEG hack
+            if tags.get_count(258, 0) == 1:
+                self.bitspersample = tags.valueof_int(258, self.bitspersample, 0)
             else:
+                value = tags.valueof(258, None, 0)
+                assert value is not None
                 # LSM might list more items than samplesperpixel
                 value = value[: self.samplesperpixel]
                 if any(v - value[0] for v in value):
@@ -672,25 +547,17 @@ cdef class TiffPage:
                     self.bitspersample = int(value[0])
 
         # SampleFormat
-        value = tags.valueof(339)
-        if value is not None:
-            if tags[339].count == 1:
-                try:
-                    self.sampleformat = SAMPLEFORMAT(value)
-                except ValueError:
-                    self.sampleformat = int(value)
+        if tags.contains_code(339):
+            if tags.get_count(339, 0) == 1:
+                self.sampleformat = tags.valueof_int(339, self.sampleformat, 0)
             else:
+                value = tags.valueof(339, None, 0)
+                assert value is not None
                 value = value[: self.samplesperpixel]
                 if any(v - value[0] for v in value):
-                    try:
-                        self.sampleformat = SAMPLEFORMAT(value)
-                    except ValueError:
-                        self.sampleformat = int(value)
+                    self.sampleformat = value
                 else:
-                    try:
-                        self.sampleformat = SAMPLEFORMAT(value[0])
-                    except ValueError:
-                        self.sampleformat = int(value[0])
+                    self.sampleformat = int(value[0])
         elif self.bitspersample == 32 and self.is_indica():
             # IndicaLabsImageWriter does not write SampleFormat tag
             self.sampleformat = SAMPLEFORMAT.IEEEFP
@@ -699,7 +566,7 @@ cdef class TiffPage:
         if tags.contains_code(322):  # TileWidth
             self.rowsperstrip = 0
         elif tags.contains_code(257):  # ImageLength
-            if not tags.contains_code(278) or tags.get(278).count > 1:  # RowsPerStrip
+            if not tags.contains_code(278) or tags.get_count(278, 0) > 1:  # RowsPerStrip
                 self.rowsperstrip = self.imagelength
             self.rowsperstrip = min(self.rowsperstrip, self.imagelength)
 
@@ -1617,7 +1484,7 @@ cdef class TiffPage:
         self._cache["chunked"] = result
         return result
 
-    cpdef int hash(self):
+    cpdef int64_t hash(self):
         """Checksum to identify pages in same series.
 
         Pages with the same hash can use the same decode function.
