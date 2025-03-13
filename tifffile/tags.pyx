@@ -1794,7 +1794,7 @@ cdef class TiffTag:
                     result.append(interprete_data_format(datatype, data_ptr + i * structsize, byteorder))
                 value = tuple(result)
             #print("read10: ", value)
-            return value
+        return value
 
     @staticmethod
     cdef object _process_value(
