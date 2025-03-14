@@ -7,10 +7,12 @@
 
 cimport cython
 from cython.operator cimport dereference, postincrement
-from libc.stdint cimport uint16_t, int32_t, uint32_t, int64_t, uint64_t
+from libc.stdint cimport uint8_t, uint16_t, int32_t, uint32_t, int64_t, uint64_t
+from libc.stdlib cimport malloc, free
 from libcpp.string cimport string as cpp_string
 from libcpp.vector cimport vector
 from libcpp.unordered_map cimport unordered_multimap as cpp_multimap
+from libcpp.unordered_set cimport unordered_set as cpp_set
 from libcpp.utility cimport pair
 from .files cimport FileHandle
 from .format cimport TiffFormat, ByteOrder, TagHeader
@@ -1485,6 +1487,147 @@ cdef object interprete_data_format(int64_t datatype, const void* data, ByteOrder
         return _bswap64(long_data[0]) if is_big_endian else long_data[0]
     return ()  # Return empty tuple for unknown datatypes
 
+cdef void parse_integer_array(vector[int64_t] &dst, const void* data, int64_t datatype, ByteOrder byteorder, int64_t count) noexcept nogil:
+    """Parse array of integers from raw data into destination vector.
+    
+    Parameters:
+        dst: Destination vector to store parsed integers
+        data: Pointer to binary data
+        datatype: TIFF DATATYPE value
+        byteorder: Byte order (little or big endian)
+        count: Number of elements to parse
+        
+    Note:
+        This function optimizes parsing by placing loops inside condition branches
+        to avoid repeated condition checks. All integer types are converted to int64_t.
+    """
+    cdef int64_t i
+    cdef bint is_big_endian = byteorder == ByteOrder.MM
+    cdef unsigned char* bytes_data
+    cdef uint16_t* short_data
+    cdef uint32_t* int_data
+    cdef uint64_t* long_data
+    cdef char* char_data
+    cdef short* sshort_data
+    cdef int* sint_data
+    cdef long long* slong_data
+    cdef unsigned char* undef_data
+    cdef uint32_t* ifd_data
+    cdef uint64_t* ifd8_data
+    
+    # Ensure the destination vector has enough capacity
+    dst.resize(count)
+    
+    # Process based on datatype
+    if datatype == <int64_t>DATATYPE.BYTE:
+        bytes_data = <unsigned char*>data
+        for i in range(count):
+            dst[i] = <int64_t>bytes_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.SHORT:
+        short_data = <uint16_t*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>_bswap16(short_data[i])
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>short_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.LONG:
+        int_data = <uint32_t*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>_bswap32(int_data[i])
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>int_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.SBYTE:
+        char_data = <char*>data
+        for i in range(count):
+            dst[i] = <int64_t>char_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.UNDEFINED:
+        undef_data = <unsigned char*>data
+        for i in range(count):
+            dst[i] = <int64_t>undef_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.SSHORT:
+        sshort_data = <short*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>(<short>_bswap16(<uint16_t>sshort_data[i]))
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>sshort_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.SLONG:
+        sint_data = <int*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>(<int>_bswap32(<uint32_t>sint_data[i]))
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>sint_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.IFD:
+        ifd_data = <uint32_t*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>_bswap32(ifd_data[i])
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>ifd_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.LONG8:
+        long_data = <uint64_t*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>_bswap64(long_data[i])
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>long_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.SLONG8:
+        slong_data = <long long*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>(<long long>_bswap64(<uint64_t>slong_data[i]))
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>slong_data[i]
+    
+    elif datatype == <int64_t>DATATYPE.IFD8:
+        ifd8_data = <uint64_t*>data
+        if is_big_endian:
+            for i in range(count):
+                dst[i] = <int64_t>_bswap64(ifd8_data[i])
+        else:
+            for i in range(count):
+                dst[i] = <int64_t>ifd8_data[i]
+
+cdef bint datatype_is_integer(int64_t datatype) noexcept nogil:
+    """Return True if datatype is integer, False otherwise.
+    
+    Parameters:
+        datatype: TIFF DATATYPE value
+        
+    Returns:
+        True if datatype represents an integer type, False otherwise
+    """
+    if (datatype == <int64_t>DATATYPE.BYTE or
+        datatype == <int64_t>DATATYPE.SHORT or
+        datatype == <int64_t>DATATYPE.LONG or 
+        datatype == <int64_t>DATATYPE.SBYTE or
+        datatype == <int64_t>DATATYPE.SSHORT or
+        datatype == <int64_t>DATATYPE.SLONG or
+        datatype == <int64_t>DATATYPE.IFD or
+        datatype == <int64_t>DATATYPE.LONG8 or
+        datatype == <int64_t>DATATYPE.SLONG8 or
+        datatype == <int64_t>DATATYPE.IFD8):
+        return True
+    return False
+
 @cython.final
 cdef class TiffTag:
     """TIFF tag structure.
@@ -1897,33 +2040,91 @@ cdef class TiffTags:
     def __cinit__(self, FileHandle fh, TiffFormat tiff):
         self._tags = []  # List to store all tags
         self._code_indices = cpp_multimap[int64_t, int]()  # Code -> indices multimap
+        self._code_set = cpp_set[int64_t]()  # Faster than checking in multimap
         self.fh = fh
         self.tiff = tiff
 
     cdef bint contains_code(self, int64_t code) noexcept nogil:
         """Check if code is in map."""
-        return self._code_indices.count(code) > 0
+        return self._code_set.count(code) > 0
 
     def contains(self, object code):
         return self.contains_code(code)
 
-    cdef int64_t _get_tag_value_as_int64(self, int index):
+    cdef int64_t _get_tag_value_as_int64(self, int index) noexcept nogil:
         """Retrieve a tag value as an int64"""
         # Check if header can directly be read as int64
         cdef int64_t datatype = self._headers[index].datatype
         cdef int64_t count = self._headers[index].count
         if count == 1:
             return self._headers[index].as_values[0].i
-        return self._get_tag_value_at(index)
+        with gil:
+            return self._get_tag_value_at(index)
 
-    cdef double _get_tag_value_as_double(self, int index):
+    cdef double _get_tag_value_as_double(self, int index) noexcept nogil:
         """Retrieve a tag value as a double"""
         # Check if header can directly be read as double
         cdef int64_t datatype = self._headers[index].datatype
         cdef int64_t count = self._headers[index].count
         if count == 1:
             return self._headers[index].as_values[0].d
-        return self._get_tag_value_at(index)
+        with gil:
+            return self._get_tag_value_at(index)
+
+    cdef bint _get_tag_value_as_int64_vec(self, vector[int64_t]& dst, int index) noexcept nogil:
+        """
+        Function that attemps to parse the tag as a vector of integers.
+        returns True on success
+        dst should be empty initially.
+
+        This function avoids creating a tag structure and does not
+        hold the gil.
+        """
+        cdef int64_t datatype = self._headers[index].datatype
+        cdef int64_t count = self._headers[index].count
+        cdef void* data
+        cdef int i
+        
+        # Check if datatype is an integer type
+        if not datatype_is_integer(datatype):
+            return False
+            
+        # If count is 0, nothing to do
+        if count == 0:
+            return True
+            
+        # Calculate value size in bytes
+        cdef int64_t structsize = get_data_format_size(datatype)
+        cdef int64_t valuesize = count * structsize
+        cdef int64_t valueoffset
+        
+        # Handle inline value (fits within tag's value field)
+        if valuesize <= self.tiff.tagoffsetthreshold:
+            # Values are already stored in the header
+            dst.resize(count)
+            for i in range(count):
+                dst[i] = self._headers[index].as_values[i].i
+            return True
+        else:
+            # Handle offset
+            valueoffset = self._headers[index].as_offset
+            
+            # Check if offset is valid
+            if valueoffset < 8 or valueoffset + valuesize > self.fh.size_c():
+                return False
+                
+            # Read data with gil
+            data = malloc(valuesize)
+            if data is NULL:
+                return False
+            if self.fh.read_into(<uint8_t*>data, valueoffset, valuesize) != valuesize:
+                free(data)
+                return False
+                
+            # Parse integer array from data
+            parse_integer_array(dst, <const void*>data, datatype, self.tiff.byteorder, count)
+            free(data)
+            return True
 
     cdef object _get_tag_value_at(self, int index):
         """Retrieve the tag value at the target index"""
@@ -1945,28 +2146,32 @@ cdef class TiffTags:
         self._tags[index] = tag
         return tag
 
-    cdef void load_tags(self, bytes data):
+    cdef int load_tags(self, uint8_t* data, int64_t count, int64_t size) noexcept nogil:
         """
         load the tags contained in data.
         """
 
         cdef vector[TagHeader] headers = vector[TagHeader]()
         cdef TagHeader header
-        cdef unsigned char *data_ptr = <unsigned char *>data
-        cdef int64_t data_len = len(data)
+        cdef int64_t data_len = count * size
         cdef pair[int64_t, int] element
-        with nogil:
-            self.tiff.parse_tag_headers(headers, data_ptr, data_len)
+        self.tiff.parse_tag_headers(headers, data, data_len)
 
-        assert not self.tiff.is_ndpi() # NDPI format is not supported yet
-
+        cdef int64_t tagslen
+        with gil:
+            if self.tiff.is_ndpi(): # NDPI format is not supported yet
+                return -1
+            tagslen = len(self._tags)
+            self._tags += [None] * count # Lazy loading
         # process the headers
         for header in headers:
             element.first = header.code
-            element.second = len(self._tags)
+            element.second = tagslen
+            tagslen += 1
             self._code_indices.insert(element)
-            self._tags.append(None) # Lazy loading
+            self._code_set.insert(header.code)
             self._headers.push_back(header)
+        return 0
 
 
     cpdef list keys(self):
@@ -2034,7 +2239,7 @@ cdef class TiffTags:
             idx = dereference(it).second
             return self._get_tag_value_at(idx)
         else:
-            if self._code_indices.count(code) == 0:
+            if self._code_set.count(code) == 0:
                 return default
             m_range = self._code_indices.equal_range(code)
             it = m_range.first
@@ -2056,7 +2261,7 @@ cdef class TiffTags:
         self,
         int64_t code,
         int64_t default,
-        int64_t index):
+        int64_t index) noexcept nogil:
         """Return int value of tag by code if exists, else default.
 
         Parameters:
@@ -2072,7 +2277,6 @@ cdef class TiffTags:
         """
         cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
         cdef cpp_multimap[int64_t, int].iterator it
-        cdef TiffTag tag
         cdef int idx
         cdef int i
 
@@ -2084,7 +2288,7 @@ cdef class TiffTags:
             idx = dereference(it).second
             return self._get_tag_value_as_int64(idx)
         else:
-            if self._code_indices.count(code) == 0:
+            if self._code_set.count(code) == 0:
                 return default
             m_range = self._code_indices.equal_range(code)
             it = m_range.first
@@ -2106,7 +2310,7 @@ cdef class TiffTags:
         self,
         int64_t code,
         double default,
-        int64_t index):
+        int64_t index) noexcept nogil:
         """Return double value of tag by code if exists, else default.
 
         Parameters:
@@ -2122,7 +2326,6 @@ cdef class TiffTags:
         """
         cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
         cdef cpp_multimap[int64_t, int].iterator it
-        cdef TiffTag tag
         cdef int idx
         cdef int i
 
@@ -2134,7 +2337,7 @@ cdef class TiffTags:
             idx = dereference(it).second
             return self._get_tag_value_as_double(idx)
         else:
-            if self._code_indices.count(code) == 0:
+            if self._code_set.count(code) == 0:
                 return default
             m_range = self._code_indices.equal_range(code)
             it = m_range.first
@@ -2151,6 +2354,46 @@ cdef class TiffTags:
             # Get the tag at the requested index
             idx = dereference(it).second
             return self._get_tag_value_as_double(idx)
+
+    cdef bint valueof_int_array(
+        self,
+        vector[int64_t] &dst,
+        int64_t code,
+        int64_t index) noexcept nogil:
+        """
+        Fills dst with an int array by parsing the content of the
+        tag. return True on success, False else.
+        """
+        cdef pair[cpp_multimap[int64_t, int].iterator, cpp_multimap[int64_t, int].iterator] m_range
+        cdef cpp_multimap[int64_t, int].iterator it
+        cdef int idx
+        cdef int i
+
+        if index == 0:  # Most common case: get first tag
+            # Find first non-None tag
+            it = self._code_indices.find(code)
+            if it == self._code_indices.end():
+                return False
+            idx = dereference(it).second
+            return self._get_tag_value_as_int64_vec(dst, idx)
+        else:
+            if self._code_set.count(code) == 0:
+                return False
+            m_range = self._code_indices.equal_range(code)
+            it = m_range.first
+            # Advance iterator to the requested index
+            i = 0
+            while i < index and it != m_range.second:
+                postincrement(it)
+                i += 1
+                
+            # If we reached the end before the requested index or no tag at index
+            if it == m_range.second:
+                return False
+                
+            # Get the tag at the requested index
+            idx = dereference(it).second
+            return self._get_tag_value_as_int64_vec(dst, idx)
 
     cpdef TiffTag get(
         self,
@@ -2184,7 +2427,7 @@ cdef class TiffTags:
             idx = dereference(it).second
             return self._get_tag_at(idx)
         else:
-            if self._code_indices.count(code) == 0:
+            if self._code_set.count(code) == 0:
                 return default
             m_range = self._code_indices.equal_range(code)
             it = m_range.first
@@ -2217,7 +2460,7 @@ cdef class TiffTags:
             idx = dereference(it).second
             return self._headers[idx].count
         else:
-            if self._code_indices.count(code) == 0:
+            if self._code_set.count(code) == 0:
                 return 0
             m_range = self._code_indices.equal_range(code)
             it = m_range.first

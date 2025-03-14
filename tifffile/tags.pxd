@@ -1,8 +1,9 @@
 #distutils: language=c++
 
-from libc.stdint cimport int32_t, int64_t
+from libc.stdint cimport uint8_t, int32_t, int64_t
 from .files cimport FileHandle
 from .format cimport TiffFormat, TagHeader
+from libcpp.unordered_set cimport unordered_set as cpp_set
 from libcpp.unordered_map cimport unordered_multimap as cpp_multimap
 from libcpp.string cimport string as cpp_string
 from libcpp.vector cimport vector
@@ -84,14 +85,16 @@ cdef class TiffTags:
     cdef TiffFormat tiff
     cdef list _tags  # Store all tags in a list. None if not loaded into a TiffTag
     cdef vector[TagHeader] _headers # headers for each tag
+    cdef cpp_set[int64_t] _code_set
     cdef cpp_multimap[int64_t, int] _code_indices  # Maps code -> list indices
     
     # Private methods
-    cdef int64_t _get_tag_value_as_int64(self, int index)
-    cdef double _get_tag_value_as_double(self, int index)
+    cdef int64_t _get_tag_value_as_int64(self, int index) noexcept nogil
+    cdef double _get_tag_value_as_double(self, int index) noexcept nogil
+    cdef bint _get_tag_value_as_int64_vec(self, vector[int64_t]& dst, int index) noexcept nogil
     cdef object _get_tag_value_at(self, int index)
     cdef TiffTag _get_tag_at(self, int index)
-    cdef void load_tags(self, bytes data)
+    cdef int load_tags(self, uint8_t* data, int64_t count, int64_t size) noexcept nogil
     cpdef list keys(self)
     cpdef list items(self)
     cpdef list values(self)
@@ -105,12 +108,17 @@ cdef class TiffTags:
         self,
         int64_t code,
         int64_t default,
-        int64_t index)
+        int64_t index) noexcept nogil
     cdef double valueof_double(
         self,
         int64_t code,
         double default,
-        int64_t index)
+        int64_t index) noexcept nogil
+    cdef bint valueof_int_array(
+        self,
+        vector[int64_t] &dst,
+        int64_t code,
+        int64_t index) noexcept nogil
     cpdef TiffTag get(
         self,
         int64_t code,

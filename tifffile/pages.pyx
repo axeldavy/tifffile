@@ -6,8 +6,10 @@
 #cython: profile=True
 #distutils: language=c++
 
+from libc.math cimport floor
 from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, free
+from libcpp.vector cimport vector
 
 from .format cimport ByteOrder, TiffFormat
 from .files cimport FileHandle
@@ -359,119 +361,136 @@ cdef class TiffPage:
         self.dtype = self._dtype = None
         self.axes = ''
         self.tags = TiffTags(self.fh, self.tiff)
-        self.dataoffsets = ()
-        self.databytecounts = ()
+        #self.dataoffsets = ()
+        #self.databytecounts = ()
         self._cache = {}
         if isinstance(index, int):
             self._index = (index,)
         else:
             self._index = tuple(index)
 
-        # Read IFD structure and tags
-        self._read_ifd_structure()
+        cdef int ifd_success
+        with nogil:
+            # Read IFD structure and tags
+            if self._read_ifd_structure() != 0:
+                raise TiffFileError('corrupted IFD structure')
             
-        # Process common tags (dimensions, format, etc)
-        self._process_common_tags()
+            # Process common tags (dimensions, format, etc)
+            self._process_common_tags()
             
-        # Handle special format tags
-        self._process_special_format_tags()
+            # Handle special format tags
+            self._process_special_format_tags()
         
-        # Process dataoffsets and databytecounts
-        self._process_data_pointers()
+            # Process dataoffsets and databytecounts
+            if self._process_data_pointers() != 0:
+                raise TiffFileError('missing required tags')
         
         # Determine image shape and dtype
         self._determine_shape_and_dtype()
 
-    cdef void _read_ifd_structure(self):
+    cdef int _read_ifd_structure(self) noexcept nogil:
         """Read the IFD structure and tags from file."""
-        cdef FileHandle fh = self.fh
         cdef bint is_little_endian = self.tiff.byteorder == ByteOrder.II
         
         # Record offset to this IFD
-        self.offset = fh.tell()
+        self.offset = self.fh.tell_c()
+        cdef int64_t cur_pos = self.offset
         
         # Read tag count more efficiently
-        cdef bytes tagno_bytes
-        cdef uint8_t* tagno_p
+        cdef uint8_t[8] tagno_p
         cdef uint16_t tagno = 0
         cdef uint64_t tagno_large = 0
         
-        try:
-            if self.tiff.tagnosize == 2:
-                # Most common case (regular TIFF)
-                tagno_bytes = fh.read(2)
-                tagno_p = tagno_bytes
-                if len(tagno_bytes) != 2:
-                    raise ValueError('Could not read tag count')
+        if self.tiff.tagnosize == 2:
+            # Most common case (regular TIFF)
+            if self.fh.read_into(&tagno_p[0], cur_pos, 2) != 2:
+                return -1 #raise ValueError('Could not read tag count')
+            cur_pos += 2
                     
-                if is_little_endian:
-                    tagno = (<uint16_t*>tagno_p)[0]
-                else:
-                    tagno = ((<uint8_t*>tagno_p)[0] << 8) | (<uint8_t*><char*>tagno_p)[1]
+            if is_little_endian:
+                tagno = (<uint16_t*>tagno_p)[0]
             else:
-                # BigTIFF
-                tagno_bytes = fh.read(8)
-                tagno_p = tagno_bytes
-                if len(tagno_bytes) != 8:
-                    raise ValueError('Could not read tag count')
-                    
-                if is_little_endian:
-                    tagno_large = (<uint64_t*>tagno_p)[0]
-                else:
-                    tagno_large = (((<uint64_t>tagno_p[0]) << 56) |
-                                   ((<uint64_t>tagno_p[1]) << 48) |
-                                   ((<uint64_t>tagno_p[2]) << 40) |
-                                   ((<uint64_t>tagno_p[3]) << 32) |
-                                   ((<uint64_t>tagno_p[4]) << 24) |
-                                   ((<uint64_t>tagno_p[5]) << 16) |
-                                   ((<uint64_t>tagno_p[6]) << 8) |
-                                    (<uint64_t>tagno_p[7]))
-                tagno = <uint16_t>tagno_large
+                tagno = (tagno_p[0] << 8) | tagno_p[1]
+        else:
+            # BigTIFF
+            if self.fh.read_into(&tagno_p[0], cur_pos, 8) != 8:
+                return -1 #raise ValueError('Could not read tag count')
+            cur_pos += 8
                 
-            if tagno > 4096:
-                raise ValueError(f'suspicious number of tags {tagno}')
-        except Exception as exc:
-            raise TiffFileError(f'corrupted tag list @{self.offset}') from exc
+            if is_little_endian:
+                tagno_large = (<uint64_t*>tagno_p)[0]
+            else:
+                tagno_large = (((<uint64_t>tagno_p[0]) << 56) |
+                               ((<uint64_t>tagno_p[1]) << 48) |
+                               ((<uint64_t>tagno_p[2]) << 40) |
+                               ((<uint64_t>tagno_p[3]) << 32) |
+                               ((<uint64_t>tagno_p[4]) << 24) |
+                               ((<uint64_t>tagno_p[5]) << 16) |
+                               ((<uint64_t>tagno_p[6]) << 8) |
+                                (<uint64_t>tagno_p[7]))
+            tagno = <uint16_t>tagno_large
+                
+        if tagno > 4096:
+            return -1 #raise ValueError(f'suspicious number of tags {tagno}')
 
-        cdef int64_t tagoffset = self.offset + self.tiff.tagnosize  # fh.tell()
-        cdef int64_t tagsize, tagsize_
-        tagsize = tagsize_ = self.tiff.tagsize
+        cdef int64_t tagoffset = self.offset + self.tiff.tagnosize  # self.fh.tell()
+        cdef int64_t tagsize = self.tiff.tagsize
 
         # Read all tag data at once
-        cdef bytes data = fh.read(tagsize * tagno)
+        cdef uint8_t *data = <uint8_t*>malloc(tagsize * tagno)
         
-        if len(data) != tagsize * tagno:
-            raise TiffFileError('corrupted IFD structure')
+        if self.fh.read_into(&data[0], cur_pos, tagsize * tagno) != tagsize * tagno:
+            free(data)
+            return -1 #raise TiffFileError('corrupted IFD structure')
 
-        self.tags.load_tags(data)
+        cdef bint res = self.tags.load_tags(data, tagno, tagsize)
+        free(<void*>data)
+        return res
 
-    cdef void _process_common_tags(self):
+    cdef void _process_common_tags(self) noexcept nogil:
+        """Process common TIFF tags and set page attributes."""
+        # Process SubfileType
+        self.subfiletype = self.tags.valueof_int(254, self.subfiletype, 0)
+
+        # Process dimension tags
+        self.imagewidth = self.tags.valueof_int(256, self.imagewidth, 0) # ImageWidth
+        self.imagelength = self.tags.valueof_int(257, self.imagelength, 0) # ImageLength
+        self.imagedepth = self.tags.valueof_int(32997, self.imagedepth, 0) # ImageDepth
+
+        # Process tile-related tags
+        self.tilewidth = self.tags.valueof_int(322, self.tilewidth, 0) # TileWidth
+        self.tilelength = self.tags.valueof_int(323, self.tilelength, 0) # TileLength
+        self.tiledepth = self.tags.valueof_int(32998, self.tiledepth, 0) # TileDepth
+
+        # Process sample-related tags
+        self.samplesperpixel = self.tags.valueof_int(277, self.samplesperpixel, 0) # SamplesPerPixel
+        self.compression = self.tags.valueof_int(259, self.compression, 0) # Compression
+        self.photometric = self.tags.valueof_int(262, self.photometric, 0) # Photometric
+        self.planarconfig = self.tags.valueof_int(284, self.planarconfig, 0) # PlanarConfig
+        self.fillorder = self.tags.valueof_int(266, self.fillorder, 0) # FillOrder
+        self.predictor = self.tags.valueof_int(317, self.predictor, 0) # Predictor
+        self.rowsperstrip = self.tags.valueof_int(278, self.rowsperstrip, 0) # RowsPerStrip
+
+        # TileWidth vs RowsPerStrip handling
+        if self.tags.contains_code(322):  # TileWidth
+            self.rowsperstrip = 0
+        elif self.tags.contains_code(257):  # ImageLength
+            if not self.tags.contains_code(278) or self.tags.get_count(278, 0) > 1:  # RowsPerStrip
+                self.rowsperstrip = self.imagelength
+            self.rowsperstrip = min(self.rowsperstrip, self.imagelength)
+
+        # tags that are processed as python objects require the gil
+        if self.tags.contains_code(338) or self.tags.contains_code(530) or\
+           self.tags.contains_code(330) or self.tags.contains_code(347) or\
+           self.tags.contains_code(270) or self.tags.contains_code(305) or\
+           (self.subfiletype == 0 and self.tags.contains_code(255)):
+            with gil:
+                self._process_common_tags_gil()
+
+    cdef void _process_common_tags_gil(self):
         """Process common TIFF tags and set page attributes."""
         cdef TiffTags tags = self.tags
         cdef object value
-        
-        # Process SubfileType
-        self.subfiletype = tags.valueof_int(254, self.subfiletype, 0)
-
-        # Process dimension tags
-        self.imagewidth = tags.valueof_int(256, self.imagewidth, 0) # ImageWidth
-        self.imagelength = tags.valueof_int(257, self.imagelength, 0) # ImageLength
-        self.imagedepth = tags.valueof_int(32997, self.imagedepth, 0) # ImageDepth
-
-        # Process tile-related tags
-        self.tilewidth = tags.valueof_int(322, self.tilewidth, 0) # TileWidth
-        self.tilelength = tags.valueof_int(323, self.tilelength, 0) # TileLength
-        self.tiledepth = tags.valueof_int(32998, self.tiledepth, 0) # TileDepth
-
-        # Process sample-related tags
-        self.samplesperpixel = tags.valueof_int(277, self.samplesperpixel, 0) # SamplesPerPixel
-        self.compression = tags.valueof_int(259, self.compression, 0) # Compression
-        self.photometric = tags.valueof_int(262, self.photometric, 0) # Photometric
-        self.planarconfig = tags.valueof_int(284, self.planarconfig, 0) # PlanarConfig
-        self.fillorder = tags.valueof_int(266, self.fillorder, 0) # FillOrder
-        self.predictor = tags.valueof_int(317, self.predictor, 0) # Predictor
-        self.rowsperstrip = tags.valueof_int(278, self.rowsperstrip, 0) # RowsPerStrip
-
         # These are tuples
         self.extrasamples = tags.valueof(338, self.extrasamples, 0) # ExtraSamples
         self.subsampling = tags.valueof(530, self.subsampling, 0) # YCbCrSubSampling
@@ -491,40 +510,74 @@ cdef class TiffPage:
             elif value == 3:
                 self.subfiletype = 0b10 # multi-page
 
-    cdef void _process_special_format_tags(self):
+    cdef void _process_special_format_tags(self) noexcept nogil:
         """Process tags specific to special file formats."""
-        cdef TiffTags tags = self.tags
-        cdef TiffTag tag
-        
         # STK (MetaMorph) format
-        if self.is_stk():
-            # read UIC1tag again now that plane count is known
-            tag = tags.get(33628)  # UIC1tag
-            assert tag is not None
-            self.fh.seek(tag.valueoffset)
-            uic2tag = tags.get(33629)  # UIC2tag
-            try:
-                tag.value = read_uic1tag(
-                    self.fh,
-                    self.tiff.byteorder,
-                    tag.dtype,
-                    tag.count,
-                    0,
-                    planecount=uic2tag.count if uic2tag is not None else 1,
-                )
-            except Exception as exc:
-                logger().warning(
-                    f'{self!r} <tifffile.read_uic1tag> raised {exc!r:.128}'
-                )
+        if self.tags.contains_code(33628):
+            with gil:
+                self._process_special_format_tags_stk()
 
         # ImageJ metadata
-        tag = tags.get(50839)
+        if self.tags.contains_code(50839):
+            with gil:
+                self._process_special_format_tags_imagej()
+
+        # BitsPerSample
+        if self.bitspersample == 1 and self.tags.contains_code(258): # not OJPEG hack
+            if self.tags.get_count(258, 0) == 1:
+                self.bitspersample = self.tags.valueof_int(258, self.bitspersample, 0)
+            else:
+                with gil:
+                    self._process_special_format_tags_bitspersample_2()
+
+        # SampleFormat
+        if self.tags.contains_code(339):
+            if self.tags.get_count(339, 0) == 1:
+                self.sampleformat = self.tags.valueof_int(339, self.sampleformat, 0)
+            else:
+                with gil:
+                    self._process_special_format_tags_sampleformat_2()
+        elif self.bitspersample == 32:
+            with gil:
+                if self.is_indica():
+                    # IndicaLabsImageWriter does not write SampleFormat tag
+                    self.sampleformat = SAMPLEFORMAT.IEEEFP
+
+        # GDAL NoData tag
+        if self.tags.contains_code(42113):
+            with gil:
+                self._process_special_format_tags_gdal()
+
+    cdef void _process_special_format_tags_stk(self):
+        cdef TiffTag tag
+        # read UIC1tag again now that plane count is known
+        tag = self.tags.get(33628)  # UIC1tag
+        assert tag is not None
+        self.fh.seek(tag.valueoffset)
+        uic2tag = self.tags.get(33629)  # UIC2tag
+        try:
+            tag.value = read_uic1tag(
+                self.fh,
+                self.tiff.byteorder,
+                tag.dtype,
+                tag.count,
+                0,
+                planecount=uic2tag.count if uic2tag is not None else 1,
+            )
+        except Exception as exc:
+            logger().warning(
+                f'{self!r} <tifffile.read_uic1tag> raised {exc!r:.128}'
+            )
+
+    cdef void _process_special_format_tags_imagej(self):
+        cdef TiffTag tag
+        tag = self.tags.get(50839)
         if tag is not None:
             # decode IJMetadata tag
             try:
                 tag.value = imagej_metadata(
                     tag.value,
-                    tags.valueof(50838),  # IJMetadataByteCounts
+                    self.tags.valueof(50838),  # IJMetadataByteCounts
                     self.tiff.byteorder_str,
                 )
             except Exception as exc:
@@ -532,46 +585,27 @@ cdef class TiffPage:
                     f'{self!r} <tifffile.imagej_metadata> raised {exc!r:.128}'
                 )
 
-        # BitsPerSample
-        if self.bitspersample == 1 and tags.contains_code(258): # not OJPEG hack
-            if tags.get_count(258, 0) == 1:
-                self.bitspersample = tags.valueof_int(258, self.bitspersample, 0)
-            else:
-                value = tags.valueof(258, None, 0)
-                assert value is not None
-                # LSM might list more items than samplesperpixel
-                value = value[: self.samplesperpixel]
-                if any(v - value[0] for v in value):
-                    self.bitspersample = value
-                else:
-                    self.bitspersample = int(value[0])
+    cdef void _process_special_format_tags_bitspersample_2(self):
+        value = self.tags.valueof(258, None, 0)
+        assert value is not None
+        # LSM might list more items than samplesperpixel
+        value = value[: self.samplesperpixel]
+        if any(v - value[0] for v in value):
+            self.bitspersample = value
+        else:
+            self.bitspersample = int(value[0])
 
-        # SampleFormat
-        if tags.contains_code(339):
-            if tags.get_count(339, 0) == 1:
-                self.sampleformat = tags.valueof_int(339, self.sampleformat, 0)
-            else:
-                value = tags.valueof(339, None, 0)
-                assert value is not None
-                value = value[: self.samplesperpixel]
-                if any(v - value[0] for v in value):
-                    self.sampleformat = value
-                else:
-                    self.sampleformat = int(value[0])
-        elif self.bitspersample == 32 and self.is_indica():
-            # IndicaLabsImageWriter does not write SampleFormat tag
-            self.sampleformat = SAMPLEFORMAT.IEEEFP
+    cdef void _process_special_format_tags_sampleformat_2(self):
+        value = self.tags.valueof(339, None, 0)
+        assert value is not None
+        value = value[: self.samplesperpixel]
+        if any(v - value[0] for v in value):
+            self.sampleformat = value
+        else:
+            self.sampleformat = int(value[0])
 
-        # TileWidth vs RowsPerStrip handling
-        if tags.contains_code(322):  # TileWidth
-            self.rowsperstrip = 0
-        elif tags.contains_code(257):  # ImageLength
-            if not tags.contains_code(278) or tags.get_count(278, 0) > 1:  # RowsPerStrip
-                self.rowsperstrip = self.imagelength
-            self.rowsperstrip = min(self.rowsperstrip, self.imagelength)
-
-        # GDAL NoData tag
-        value = tags.valueof(42113)  # GDAL_NODATA
+    cdef void _process_special_format_tags_gdal(self):
+        value = self.tags.valueof(42113)  # GDAL_NODATA
         if value is not None and self.dtype is not None:
             try:
                 pytype = type(self.dtype.type(0).item())
@@ -589,91 +623,109 @@ cdef class TiffPage:
                 )
                 self.nodata = 0
 
-    cdef void _process_data_pointers(self):
+    cdef int _process_data_pointers(self) noexcept nogil:
         """Process dataoffsets and databytecounts tags."""
-        cdef TiffTags tags = self.tags
-        cdef FileHandle fh = self.fh
+        cdef bint success
+        cdef int64_t i, n
+        cdef int64_t first_offset, first_bytecount
         
         # Get data offsets - check multiple possible sources
-        self.dataoffsets = tags.valueof(324)  # TileOffsets
-        if self.dataoffsets is None:
-            self.dataoffsets = tags.valueof(273)  # StripOffsets
-            if self.dataoffsets is None:
-                self.dataoffsets = tags.valueof(513)  # JPEGInterchangeFormat
-                if self.dataoffsets is None:
-                    self.dataoffsets = ()
-                    logger().error(f'{self!r} missing data offset tag')
+        success = self.tags.valueof_int_array(self._dataoffsets, 324, 0)  # TileOffsets
+        if not success:
+            success = self.tags.valueof_int_array(self._dataoffsets, 273, 0)  # StripOffsets
+            if not success:
+                success = self.tags.valueof_int_array(self._dataoffsets, 513, 0)  # JPEGInterchangeFormat
+                if not success:
+                    #self._dataoffsets = empty_vec
+                    #logger().error(f'{self!r} missing data offset tag')
+                    return -1
         
         # Get data byte counts
-        self.databytecounts = tags.valueof(325)  # TileByteCounts
-        if self.databytecounts is None:
-            self.databytecounts = tags.valueof(279)  # StripByteCounts
-            if self.databytecounts is None:
-                self.databytecounts = tags.valueof(514)  # JPEGInterchangeFormatLength
+        success = self.tags.valueof_int_array(self._databytecounts, 325, 0)  # TileByteCounts
+        if not success:
+            success = self.tags.valueof_int_array(self._databytecounts, 279, 0)  # StripByteCounts
+            if not success:
+                success = self.tags.valueof_int_array(self._databytecounts, 514, 0)  # JPEGInterchangeFormatLength
+                #if not success:
+                #    self._databytecounts = empty_vec
 
         # Special handling for NDPI files with JPEG McuStarts
-        mcustarts = tags.valueof(65426)
-        if mcustarts is not None and self.is_ndpi():
-            # use NDPI JPEG McuStarts as tile offsets
-            mcustarts = mcustarts.astype(numpy.int64)
-            high = tags.valueof(65432)
-            if high is not None:
-                # McuStartsHighBytes
-                high = high.astype(numpy.uint64)
-                high <<= 32
-                mcustarts += high.astype(numpy.int64)
-            jpegheader = fh.read_at(self.dataoffsets[0], mcustarts[0])
-            try:
-                (
-                    self.tilelength,
-                    self.tilewidth,
-                    self.jpegheader,
-                ) = ndpi_jpeg_tile(jpegheader)
-            except ValueError as exc:
-                logger().warning(
-                    f'{self!r} <tifffile.ndpi_jpeg_tile> raised {exc!r:.128}'
-                )
-            else:
-                # Create data pointers from MCU starts
-                databytecounts = numpy.diff(
-                    mcustarts, append=self.databytecounts[0]
-                )
-                self.databytecounts = tuple(databytecounts.tolist())
-                mcustarts += self.dataoffsets[0]
-                self.dataoffsets = tuple(mcustarts.tolist())
+        ''' # TODO NPDI
+        cdef vector[int64_t] mcustarts
+        cdef int64_t high
+        if self.tags.contains_code(65426):
+            success = self.tags.valueof_int_array(mcustarts, 65426, 0)
+            if success and (self.tags.contains_code(65420) and self.tags.contains_code(271)): # is_ndpi
+                high = self.tags.valueof_int(65432, -1, 0)
+                if high != -1:
+                    high <<= 32
+                    for i in range(mcustarts.size()):
+                        mcustarts[i] += high
+
+                jpegheader = self.fh.read_at(self._dataoffsets[0], mcustarts[0])
+                try:
+                    (
+                        self.tilelength,
+                        self.tilewidth,
+                        self.jpegheader,
+                    ) = ndpi_jpeg_tile(jpegheader)
+                except ValueError as exc:
+                    logger().warning(
+                        f'{self!r} <tifffile.ndpi_jpeg_tile> raised {exc!r:.128}'
+                    )
+                else:
+                    # Create data pointers from MCU starts
+                    i, n = mcustarts.size
+                    first_offset = self._dataoffsets[0]
+                    first_bytecount = self._databytecounts[0]
+                    
+                    # Calculate bytecounts as differences between consecutive offsets
+                    # and calculate offsets
+                    self._dataoffsets.clear()
+                    self._databytecounts.clear()
+                    self._databytecounts.reserve(n)
+                    self._dataoffsets.reserve(n)
+                    for i in range(n-1):
+                        self._databytecounts.push_back(mcustarts[i+1] - mcustarts[i])
+                    self._databytecounts.push_back(first_bytecount - mcustarts[n-1])
+
+                    for i in range(n):
+                        self._dataoffsets.push_back(mcustarts[i] + first_offset)
+        '''
 
         # Fix incorrect number of strip bytecounts and offsets
         cdef int64_t maxstrips
-        if self.imagelength and self.rowsperstrip and not self.is_lsm():
+        cdef size_t dataoffsets_size = self._dataoffsets.size()
+        cdef size_t databytecounts_size = self._databytecounts.size()
+        
+        if self.imagelength != 0\
+           and self.rowsperstrip\
+           and not self.tags.contains_code(34412):
             maxstrips = (
-                int(
-                    math.floor(self.imagelength + self.rowsperstrip - 1)
+                <int64_t>(
+                    floor(self.imagelength + self.rowsperstrip - 1)
                     / self.rowsperstrip
                 )
                 * self.imagedepth
             )
             if self.planarconfig == 2:
                 maxstrips *= self.samplesperpixel
-            if maxstrips != len(self.databytecounts):
-                logger().error(
-                    f'{self!r} incorrect StripByteCounts count '
-                    f'({len(self.databytecounts)} != {maxstrips})'
-                )
-                self.databytecounts = self.databytecounts[:maxstrips]
-            if maxstrips != len(self.dataoffsets):
-                logger().error(
-                    f'{self!r} incorrect StripOffsets count '
-                    f'({len(self.dataoffsets)} != {maxstrips})'
-                )
-                self.dataoffsets = self.dataoffsets[:maxstrips]
+                
+            if maxstrips != databytecounts_size:
+                return -1
+                    
+            if maxstrips != dataoffsets_size:
+                return -1
 
-        # Create databytecounts if missing but required
-        if not self.databytecounts and self.shape and self.dtype:
-            self.databytecounts = (
-                product(self.shape) * (self.bitspersample // 8),
-            )
-            if self.compression != 1:
-                logger().error(f'{self!r} missing ByteCounts tag')
+        ## Create databytecounts if missing but required
+        #if self._databytecounts.empty() and self.shape is not None and self.dtype is not None:
+        #    self._databytecounts.push_back(product(self.shape) * (self.bitspersample // 8))
+        #    if self.compression != 1:
+        #        return -1
+        # TODO: must be incorrect because self.shape is filled after
+        if self._databytecounts.empty():
+            return -1
+        return 0
 
     cdef void _determine_shape_and_dtype(self):
         """Determine the shape and dtype of the image data."""
@@ -822,6 +874,7 @@ cdef class TiffPage:
         """
         global THREADPOOL
         cdef TiffPage keyframe = self.keyframe  # self or keyframe
+        cdef int i, n
         
         if _fullsize is None:
             _fullsize = keyframe.is_tiled()
@@ -843,7 +896,13 @@ cdef class TiffPage:
 
         if maxworkers is None or maxworkers < 1:
             maxworkers = keyframe.maxworkers
-        segments = [(self.fh, self.dataoffsets[i], self.databytecounts[i], i) for i in range(len(self.dataoffsets))]
+            
+        # Use vectors directly to create segments more efficiently
+        dataoffsets = self._dataoffsets
+        databytecounts = self._databytecounts
+        n = dataoffsets.size()
+        segments = [(self.fh, dataoffsets[i], databytecounts[i], i) for i in range(n)]
+        
         if maxworkers < 2:
             for segment in segments:
                 yield process(segment)
@@ -911,7 +970,7 @@ cdef class TiffPage:
         if 0 in tuple(keyframe.shaped) or keyframe._dtype is None:
             return numpy.empty((0,), keyframe.dtype)
 
-        if len(self.dataoffsets) == 0:
+        if self._dataoffsets.size() == 0:
             raise TiffFileError('missing data offset')
 
         cdef FileHandle fh = self.fh
@@ -979,7 +1038,7 @@ cdef class TiffPage:
         return self.fh.memmap_array(
             keyframe.tiff.byteorder + keyframe._dtype.char,
             keyframe.shaped,
-            offset=self.dataoffsets[0],
+            offset=self._dataoffsets[0],
         )
 
     cdef object _asarray_contiguous(self, out):
@@ -1005,7 +1064,7 @@ cdef class TiffPage:
         result = self.fh.read_array(
             keyframe.tiff.byteorder_str + keyframe._dtype.char,
             count=product(keyframe.shaped),
-            offset=self.dataoffsets[0],
+            offset=self._dataoffsets[0],
             out=out,
         )
         
@@ -1301,6 +1360,16 @@ cdef class TiffPage:
         return coords
 
     @property
+    def dataoffsets(self):
+        """Offsets to image data."""
+        return tuple(self._dataoffsets)
+
+    @property
+    def databytecounts(self):
+        """Byte counts of image data."""
+        return tuple(self._databytecounts)
+
+    @property
     def attr(self) -> dict[str, Any]:
         """Arbitrary metadata associated with image array."""
         # TODO: what to return?
@@ -1561,7 +1630,7 @@ cdef class TiffPage:
             50002,  # jpegxl
             52546,  # jpegxl DNG
             }: # TIFF.IMAGE_COMPRESSIONS
-            return min(MAXWORKERS, len(self.dataoffsets))
+            return min(MAXWORKERS, self._dataoffsets.size())
         bytecount = product(self.chunks) * self.dtype.itemsize
         if bytecount < 2048:
             # disable multi-threading for small segments
@@ -1569,11 +1638,11 @@ cdef class TiffPage:
         if self.compression == 5 and bytecount < 14336:
             # disable multi-threading for small LZW compressed segments
             return 0
-        if len(self.dataoffsets) < 4:
+        if self._dataoffsets.size() < 4:
             return 1
         if self.compression != 1 or self.fillorder != 1 or self.predictor != 1:
             if imagecodecs is not None:
-                return min(MAXWORKERS, len(self.dataoffsets))
+                return min(MAXWORKERS, self._dataoffsets.size())
         return 2  # optimum for large number of uncompressed tiles
 
     cpdef bint is_contiguous(self):
@@ -1612,22 +1681,21 @@ cdef class TiffPage:
             ):
                 self._cache["is_contiguous"] = False
                 return False
-        offsets = self.dataoffsets
-        bytecounts = self.databytecounts
-        if len(offsets) == 0:
+
+        if self._dataoffsets.empty():
             self._cache["is_contiguous"] = False
             return False
-        if len(offsets) == 1:
+        if self._dataoffsets.size() == 1:
             self._cache["is_contiguous"] = True
             return True
         if self.is_stk() or self.is_lsm():
             self._cache["is_contiguous"] = False
             return True
-        if sum(bytecounts) != self.nbytes:
+        if sum(self._databytecounts) != self.nbytes:
             self._cache["is_contiguous"] = False
             return False
-        for i in range(len(offsets) - 1):
-            if bytecounts[i] == 0 or offsets[i] + bytecounts[i] != offsets[i + 1]:
+        for i in range(self._dataoffsets.size() - 1):
+            if self._databytecounts[i] == 0 or self._dataoffsets[i] + self._databytecounts[i] != self._dataoffsets[i + 1]:
                 self._cache["is_contiguous"] = False
                 return False
         self._cache["is_contiguous"] = True
@@ -1650,7 +1718,7 @@ cdef class TiffPage:
             # and (self.bitspersample == 8 or self.parent.isnative)
             # aligned?
             and self.dtype is not None
-            and self.dataoffsets[0] % self.dtype.itemsize == 0
+            and self._dataoffsets[0] % self.dtype.itemsize == 0
         )
 
     @property
@@ -1690,13 +1758,13 @@ cdef class TiffPage:
         """JPEG compressed segments contain JFIF metadata."""
         if (
             self.compression not in {6, 7, 34892, 33007}
-            or len(self.dataoffsets) < 1
-            or self.dataoffsets[0] == 0
-            or len(self.databytecounts) < 1
-            or self.databytecounts[0] < 11
+            or self._dataoffsets.size() < 1
+            or self._dataoffsets[0] == 0
+            or self._databytecounts.empty()
+            or self._databytecounts[0] < 11
         ):
             return False
-        data = self.fh.read_at(self.dataoffsets[0] + 6, 4)
+        data = self.fh.read_at(self._dataoffsets[0] + 6, 4)
         return data == b'JFIF'  # or data == b'Exif'
 
     cpdef bint is_ndpi(self):

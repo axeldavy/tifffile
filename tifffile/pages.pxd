@@ -1,5 +1,6 @@
 #cython: language_level=3
 from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libcpp.vector cimport vector
 
 from .files cimport FileHandle
 from .format cimport ByteOrder, TiffFormat
@@ -16,8 +17,8 @@ cdef class TiffPage:
     cdef public tuple shape
     cdef public object dtype
     cdef public str axes
-    cdef public tuple dataoffsets
-    cdef public tuple databytecounts
+    cdef public vector[int64_t] _dataoffsets
+    cdef public vector[int64_t] _databytecounts
     cdef public int64_t[5] shaped
     
     # Internal attributes
@@ -53,10 +54,16 @@ cdef class TiffPage:
     cdef public float nodata
 
     # Read IFD structure and tags
-    cdef void _read_ifd_structure(self)
-    cdef void _process_common_tags(self)
-    cdef void _process_special_format_tags(self)
-    cdef void _process_data_pointers(self)
+    cdef int _read_ifd_structure(self) noexcept nogil
+    cdef void _process_common_tags(self) noexcept nogil
+    cdef void _process_common_tags_gil(self)
+    cdef void _process_special_format_tags(self) noexcept nogil
+    cdef void _process_special_format_tags_stk(self)
+    cdef void _process_special_format_tags_imagej(self)
+    cdef void _process_special_format_tags_bitspersample_2(self)
+    cdef void _process_special_format_tags_sampleformat_2(self)
+    cdef void _process_special_format_tags_gdal(self)
+    cdef int _process_data_pointers(self) noexcept nogil
     cdef void _determine_shape_and_dtype(self)
 
     # Read image data
@@ -119,89 +126,3 @@ cdef class TiffPage:
     cpdef bint is_shaped(self)
     cpdef bint is_mdgel(self)
     cpdef bint is_agilent(self)
-
-'''
-cdef public TiffTags tags
-    """Tags belonging to page."""
-    cdef public object parent
-    """TiffFile instance page belongs to."""
-    cdef public int64_t offset
-    """Position of page in file."""
-    cdef public tuple shape#: tuple[int, ...]
-    """Shape of image array in page."""
-    cdef public object dtype#: numpy.dtype[Any] | None
-    """Data type of image array in page."""
-    cdef public int64_t[5] shaped
-    """Normalized 5-dimensional shape of image array in page:
-
-        0. separate samplesperpixel or 1.
-        1. imagedepth or 1.
-        2. imagelength.
-        3. imagewidth.
-        4. contig samplesperpixel or 1.
-
-    """
-    cdef public str axes
-    """Character codes for dimensions in image array:
-    'S' sample, 'X' width, 'Y' length, 'Z' depth.
-    """
-    cdef public tuple dataoffsets#: tuple[int, ...]
-    """Positions of strips or tiles in file."""
-    cdef public tuple databytecounts#: tuple[int, ...]
-    """Size of strips or tiles in file."""
-    cdef object _dtype#: numpy.dtype[Any] | None
-    cdef tuple _index#: tuple[int, ...]  # index of page in IFD tree
-
-    # default properties; might be updated from tags
-    cdef public int64_t subfiletype
-    """:py:class:`FILETYPE` kind of image."""
-    cdef public int64_t imagewidth
-    """Number of columns (pixels per row) in image."""
-    cdef public int64_t imagelength
-    """Number of rows in image."""
-    cdef public int64_t imagedepth
-    """Number of Z slices in image."""
-    cdef public int64_t tilewidth
-    """Number of columns in each tile."""
-    cdef public int64_t tilelength
-    """Number of rows in each tile."""
-    cdef public int64_t tiledepth
-    """Number of Z slices in each tile."""
-    cdef public int64_t samplesperpixel
-    """Number of components per pixel."""
-    cdef public int64_t bitspersample
-    """Number of bits per pixel component."""
-    cdef public int64_t sampleformat
-    """:py:class:`SAMPLEFORMAT` type of pixel components."""
-    cdef public int64_t rowsperstrip
-    """Number of rows per strip."""
-    cdef public int64_t compression
-    """:py:class:`COMPRESSION` scheme used on image data."""
-    cdef public int64_t planarconfig
-    """:py:class:`PLANARCONFIG` type of storage of components in pixel."""
-    cdef public int64_t fillorder
-    """Logical order of bits within byte of image data."""
-    cdef public int64_t photometric
-    """:py:class:`PHOTOMETRIC` color space of image."""
-    cdef public int64_t predictor
-    """:py:class:`PREDICTOR` applied to image data before compression."""
-    cdef public tuple extrasamples # tuple[int, ...]
-    """:py:class:`EXTRASAMPLE` interpretation of extra components in pixel."""
-    cdef public tuple subsampling # int64_t[2]
-    """Subsampling factors used for chrominance components."""
-    cdef public tuple subifds # tuple[int, ...]
-    """Positions of SubIFDs in file."""
-    cdef public bytes jpegtables
-    """JPEG quantization and Huffman tables."""
-    cdef public bytes jpegheader
-    """JPEG header for NDPI."""
-    cdef public str software
-    """Software used to create image."""
-    cdef public str description
-    """Subject of image."""
-    cdef public str description1
-    """Value of second ImageDescription tag."""
-    cdef public float nodata # int64_t | float
-    """Value used for missing data. The value of the GDAL_NODATA tag or 0."""
-
-'''
