@@ -153,6 +153,7 @@ cdef class TiffFormatClassicLE(TiffFormat):
         self.version = 42
         self.byteorder = ByteOrder.II
         self.offsetsize = 4
+        self.headersize = 8  # 2 bytes byteorder + 2 bytes version + 4 bytes IFD offset
         self.offsetformat = '<I'
         self.tagnosize = 2
         self.tagnoformat = '<H'
@@ -272,6 +273,7 @@ cdef class TiffFormatClassicBE(TiffFormat):
         self.version = 42
         self.byteorder = ByteOrder.MM
         self.offsetsize = 4
+        self.headersize = 8  # 2 bytes byteorder + 2 bytes version + 4 bytes IFD offset
         self.offsetformat = '>I'
         self.tagnosize = 2
         self.tagnoformat = '>H'
@@ -393,6 +395,7 @@ cdef class TiffFormatBigLE(TiffFormat):
         self.version = 43
         self.byteorder = ByteOrder.II
         self.offsetsize = 8
+        self.headersize = 16  # 2 bytes byteorder + 2 bytes version + 2 bytes bytesize + 2 bytes reserved + 8 bytes IFD offset
         self.offsetformat = '<Q'
         self.tagnosize = 8
         self.tagnoformat = '<Q'
@@ -565,6 +568,7 @@ cdef class TiffFormatBigBE(TiffFormat):
         self.version = 43
         self.byteorder = ByteOrder.MM
         self.offsetsize = 8
+        self.headersize = 16  # 2 bytes byteorder + 2 bytes version + 2 bytes bytesize + 2 bytes reserved + 8 bytes IFD offset
         self.offsetformat = '>Q'
         self.tagnosize = 8
         self.tagnoformat = '>Q'
@@ -754,6 +758,7 @@ cdef class TiffFormatNDPI_LE(TiffFormat):
         self.version = 42
         self.byteorder = ByteOrder.II
         self.offsetsize = 8
+        self.headersize = 8  # 2 bytes byteorder + 2 bytes version + 4 bytes IFD offset
         self.offsetformat = '<Q'
         self.tagnosize = 2
         self.tagnoformat = '<H'

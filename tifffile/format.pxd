@@ -36,6 +36,9 @@ cdef class TiffFormat:
     cdef public int64_t offsetsize
     """Size of offsets."""
 
+    cdef public int64_t headersize
+    """Size of the format header."""
+
     cdef public str offsetformat
     """Struct format for offset values."""
 

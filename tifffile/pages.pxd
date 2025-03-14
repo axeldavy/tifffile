@@ -23,7 +23,6 @@ cdef class TiffPage:
     
     # Internal attributes
     cdef object _dtype
-    cdef tuple _index
     cdef dict _cache
     
     # Page properties
@@ -52,6 +51,13 @@ cdef class TiffPage:
     cdef public str description
     cdef public str description1
     cdef public float nodata
+
+    @staticmethod
+    cdef TiffPage from_file(
+        FileHandle filehandle,
+        TiffFormat tiff,
+        int64_t offset
+    )
 
     # Read IFD structure and tags
     cdef int _read_ifd_structure(self) noexcept nogil
@@ -117,7 +123,6 @@ cdef class TiffPage:
     cpdef bint is_sis(self)
     cpdef bint is_frame(self)
     cpdef bint is_virtual(self)
-    cpdef bint is_subifd(self)
     cpdef bint is_reduced(self)
     cpdef bint is_multipage(self)
     cpdef bint is_mask(self)

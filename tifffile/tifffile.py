@@ -961,6 +961,7 @@ from .tags import TiffTag, TiffTags
 from .files import FileHandle
 from .format import *
 from .pages import TiffPage
+from .reading import TiffFile
 
 @overload
 def imread(
@@ -4156,7 +4157,7 @@ class TiffWriter:
 
 
 @final
-class TiffFile:
+class TiffFile_:
     """Read image and metadata from TIFF file.
 
     TiffFile instances must be closed with :py:meth:`TiffFile.close`, which

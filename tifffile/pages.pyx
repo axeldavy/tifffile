@@ -13,6 +13,7 @@ from libcpp.vector cimport vector
 
 from .format cimport ByteOrder, TiffFormat
 from .files cimport FileHandle
+from .series cimport TiffPages
 from .tags cimport TiffTag, TiffTags
 from .tags import read_uic1tag
 from .types import COMPRESSION, PHOTOMETRIC, SAMPLEFORMAT, PREDICTOR,\
@@ -331,13 +332,12 @@ cdef class TiffPage:
         self.description1 = ''
         self.nodata = 0
 
-    def __init__(
-        self,
-        parent: TiffFile,
-        index: int | Sequence[int],
-        *,
-        TiffPage keyframe = None,
-    ) -> None:
+    @staticmethod
+    cdef TiffPage from_file(
+        FileHandle filehandle,
+        TiffFormat tiff,
+        int64_t offset
+    ):
         """Initialize TiffPage from file.
         
         Parameters:
@@ -350,11 +350,12 @@ cdef class TiffPage:
             TiffFileError: Invalid TIFF structure.
         """
         cdef TiffTag tag, uic2tag
-        cdef TiffFormat tiff = parent.tiff
         cdef int64_t tagno
+        cdef TiffPage self = TiffPage.__new__(TiffPage)
 
         # Initialize basic attributes
-        self.fh = parent.filehandle
+        self.fh = filehandle
+        self.offset = offset
         self.tiff = tiff
         self.shape = ()
         self.shaped = (0, 0, 0, 0, 0)
@@ -364,10 +365,6 @@ cdef class TiffPage:
         #self.dataoffsets = ()
         #self.databytecounts = ()
         self._cache = {}
-        if isinstance(index, int):
-            self._index = (index,)
-        else:
-            self._index = tuple(index)
 
         cdef int ifd_success
         with nogil:
@@ -387,13 +384,12 @@ cdef class TiffPage:
         
         # Determine image shape and dtype
         self._determine_shape_and_dtype()
+        return self
 
     cdef int _read_ifd_structure(self) noexcept nogil:
         """Read the IFD structure and tags from file."""
         cdef bint is_little_endian = self.tiff.byteorder == ByteOrder.II
         
-        # Record offset to this IFD
-        self.offset = self.fh.tell_c()
         cdef int64_t cur_pos = self.offset
         
         # Read tag count more efficiently
@@ -974,6 +970,10 @@ cdef class TiffPage:
             raise TiffFileError('missing data offset')
 
         cdef FileHandle fh = self.fh
+        if maxworkers is None or maxworkers < 1:
+            maxworkers = keyframe.maxworkers
+        if buffersize is None:
+            buffersize = -1
 
         # Check if we need to open the file
         closed = fh.closed
@@ -1177,16 +1177,6 @@ cdef class TiffPage:
             
         return result
 
-    def aszarr(self, **kwargs: Any) -> ZarrTiffStore:
-        """Return image from page as Zarr 2 store.
-
-        Parameters:
-            **kwarg: Passed to :py:class:`ZarrTiffStore`.
-
-        """
-        from .tifffile import ZarrTiffStore
-        return ZarrTiffStore(self, **kwargs)
-
     def asrgb(
         self,
         *,
@@ -1280,16 +1270,6 @@ cdef class TiffPage:
         return self
 
     @property
-    def index(self) -> int:
-        """Index of page in IFD chain."""
-        return self._index[-1]
-
-    @property
-    def treeindex(self) -> tuple[int, ...]:
-        """Index of page in IFD tree."""
-        return self._index
-
-    @property
     def keyframe(self) -> TiffPage:
         """Self."""
         return self
@@ -1297,12 +1277,6 @@ cdef class TiffPage:
     @keyframe.setter
     def keyframe(self, index: TiffPage) -> None:
         return
-
-    @property
-    def name(self) -> str:
-        """Name of image array."""
-        index = self._index if len(self._index) > 1 else self._index[0]
-        return f'TiffPage {index}'
 
     @property
     def ndim(self) -> int:
@@ -1598,8 +1572,12 @@ cdef class TiffPage:
             return None
         if "pages" in self._cache:
             return self._cache["pages"]
-        from .tifffile import TiffPages
-        result = TiffPages(self, index=self.index)
+        cdef vector[int64_t] offsets
+        self.tags.valueof_int_array(offsets, 330, 0) # Is it ok ?
+        result = TiffPages.from_parent(
+            self.fh,
+            self.tiff,
+            offsets)
         self._cache["pages"] = result
         return result
 
@@ -1956,10 +1934,6 @@ cdef class TiffPage:
     cpdef bint is_virtual(self):
         """Page does not have IFD structure in file."""
         return False
-
-    cpdef bint is_subifd(self):
-        """Page is SubIFD of another page."""
-        return len(self._index) > 1
 
     cpdef bint is_reduced(self):
         """Page is reduced image of another image."""
