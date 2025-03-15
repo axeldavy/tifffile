@@ -895,6 +895,7 @@ __all__ = [
     'update_kwargs',
     'validate_jhove',
     'xml2dict',
+    'fast_parsing_zstd_delta',
     '_TIFF',  # private
 ]
 
@@ -962,6 +963,7 @@ from .files import FileHandle
 from .format import *
 from .pages import TiffPage
 from .reading import TiffFile
+from .custom import fast_parsing_zstd_delta
 
 @overload
 def imread(

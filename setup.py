@@ -89,6 +89,14 @@ if 'sdist' in sys.argv:
 
 extensions = [
     Extension(
+        "tifffile.custom",
+        ["tifffile/custom.pyx"],
+        language="c++",
+        #include_dirs=[np.get_include()],
+        extra_compile_args=['-O3'],
+        #libraries=libraries,
+        #extra_link_args=linking_args,
+    ),Extension(
         "tifffile.decoder",
         ["tifffile/decoder.pyx"],
         language="c++",
