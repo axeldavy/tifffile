@@ -29,6 +29,5 @@ cdef class FileHandle:
     cpdef bytes read_at(self, int64_t offset, int64_t size)
     cpdef object read_array(self, object dtype, int64_t count=?, int64_t offset=?, object out=?)
     cpdef object read_record(self, object dtype, object shape=?, object byteorder=?)
-    
-    # New method with proper locking (changed from cdef to cpdef)
+
     cdef int64_t read_into(self, unsigned char* dst, int64_t offset, int64_t size) noexcept nogil

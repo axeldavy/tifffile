@@ -47,9 +47,6 @@ cdef class TiffPage:
     cdef public tuple subifds
     cdef public bytes jpegtables
     cdef public bytes jpegheader
-    cdef public str software
-    cdef public str description
-    cdef public str description1
     cdef public float nodata
 
     @staticmethod

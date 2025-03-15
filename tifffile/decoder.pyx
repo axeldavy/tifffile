@@ -7,6 +7,7 @@
 #distutils: language=c++
 
 from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libcpp.vector cimport vector
 
 import numpy
 import imagecodecs
@@ -743,6 +744,10 @@ cdef class TiffDecoder:
                     page.imagewidth * page.samplesperpixel
                 )
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        raise NotImplementedError("Subclass must implement get_instance")
+
 cdef class TiffDecoderError(TiffDecoder):
     """Decoder that raises an error."""
     
@@ -751,6 +756,10 @@ cdef class TiffDecoderError(TiffDecoder):
         cdef TiffDecoderError decoder = TiffDecoderError(page)
         decoder.error_message = error_message
         return decoder
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderErrorInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
 
 cdef class TiffDecoderJpeg(TiffDecoder):
     """Decoder for JPEG compressed segments."""
@@ -767,7 +776,7 @@ cdef class TiffDecoderJpeg(TiffDecoder):
         cdef object jpegtables = kwargs.get('jpegtables', None)
         cdef object jpegheader = kwargs.get('jpegheader', None)
         cdef tuple segmentindex, shape
-        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
+        cdef object data = None if read_len <= 0 else fh.read_array(numpy.uint8, offset=offset, count=read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -789,6 +798,10 @@ cdef class TiffDecoderJpeg(TiffDecoder):
             data_array, shape = self.pad_data(data_array, shape)
         return data_array, segmentindex, shape
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderJpegInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
 cdef class TiffDecoderEer(TiffDecoder):
     """Decoder for EER compressed segments."""
     
@@ -804,7 +817,7 @@ cdef class TiffDecoderEer(TiffDecoder):
     def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
-        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
+        cdef object data = None if read_len <= 0 else fh.read_array(numpy.uint8, offset=offset, count=read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -822,6 +835,10 @@ cdef class TiffDecoderEer(TiffDecoder):
         )
         return data_array.reshape(shape), segmentindex, shape
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderEerInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
 cdef class TiffDecoderJetraw(TiffDecoder):
     """Decoder for Jetraw compressed segments."""
     
@@ -834,7 +851,7 @@ cdef class TiffDecoderJetraw(TiffDecoder):
     def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
-        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
+        cdef object data = None if read_len <= 0 else fh.read_array(numpy.uint8, offset=offset, count=read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -845,6 +862,10 @@ cdef class TiffDecoderJetraw(TiffDecoder):
         data_array = numpy.zeros(shape, numpy.uint16)
         self.decompress(data, out=data_array)
         return data_array, segmentindex, shape
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderJetrawInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
 
 cdef class TiffDecoderImage(TiffDecoder):
     """Decoder for image compressions."""
@@ -858,7 +879,7 @@ cdef class TiffDecoderImage(TiffDecoder):
     def __call__(self, FileHandle fh, int64_t offset, int64_t read_len, int64_t index, **kwargs):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
-        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
+        cdef object data = None if read_len <= 0 else fh.read_array(numpy.uint8, offset=offset, count=read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -872,6 +893,10 @@ cdef class TiffDecoderImage(TiffDecoder):
             data_array, shape = self.pad_data(data_array, shape)
         return data_array, segmentindex, shape
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderImageInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
 cdef class TiffDecoderBase(TiffDecoder):
     """Base class for other format decoders."""
     
@@ -879,7 +904,7 @@ cdef class TiffDecoderBase(TiffDecoder):
         cdef bint _fullsize = kwargs.get('_fullsize', False)
         cdef tuple segmentindex, shape
         cdef int64_t size
-        cdef object data = None if read_len <= 0 else fh.read_at(offset, read_len)
+        cdef object data = None if read_len <= 0 else fh.read_array(numpy.uint8, offset=offset, count=read_len)
         
         segmentindex, shape = self.get_indices_shape(index)
         if data is None:
@@ -906,6 +931,10 @@ cdef class TiffDecoderBase(TiffDecoder):
         """Unpack data."""
         raise NotImplementedError("Subclass must implement unpack")
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderBaseInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
 cdef class TiffDecoderComplexInt(TiffDecoderBase):
     """Decoder for complex integers."""
     
@@ -923,6 +952,10 @@ cdef class TiffDecoderComplexInt(TiffDecoderBase):
     cdef object unpack(self, object data):
         """Return complex integer as numpy.complex."""
         return numpy.frombuffer(data, self.itype).astype(self.ftype).view(self.dtype)
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderComplexIntInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
 
 cdef class TiffDecoderRegular(TiffDecoderBase):
     """Decoder for regular data types."""
@@ -947,6 +980,10 @@ cdef class TiffDecoderRegular(TiffDecoderBase):
             size = (len(data) // bps) * bps
             return numpy.frombuffer(data[:size], self.dtype)
 
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderRegularInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
 cdef class TiffDecoderRGB(TiffDecoderBase):
     """Decoder for RGB packed integers."""
     
@@ -963,6 +1000,10 @@ cdef class TiffDecoderRGB(TiffDecoderBase):
     cdef object unpack(self, object data):
         """Return numpy array from packed integers."""
         return unpack_rgb(data, self.dtype, self.bitspersample_rgb)
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderRGBInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
 
 cdef class TiffDecoderFloat24(TiffDecoderBase):
     """Decoder for float24 data type."""
@@ -981,6 +1022,10 @@ cdef class TiffDecoderFloat24(TiffDecoderBase):
         return imagecodecs.float24_decode(
             data, byteorder=self.page.tiff.byteorder_str
         )
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderFloat24Instance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
 
 cdef class TiffDecoderPackedBits(TiffDecoderBase):
     """Decoder for bilevel and packed integers."""
@@ -1001,3 +1046,276 @@ cdef class TiffDecoderPackedBits(TiffDecoderBase):
         return imagecodecs.packints_decode(
             data, self.dtype, self.bitspersample, runlen=self.runlen
         )
+
+    cdef TiffDecoderInstance get_instance(self, object fh, vector[int64_t] offsets, vector[int64_t] read_lengths, vector[int64_t] indices, object output_fun, dict kwargs):
+        """Create an instance for batch processing."""
+        return TiffDecoderInstance.create(TiffDecoderPackedBitsInstance, self, fh, offsets, read_lengths, indices, output_fun, kwargs)
+
+cdef class TiffDecoderInstance:
+    """Base class for batch decoder instances."""
+    @staticmethod
+    cdef TiffDecoderInstance create(cls, TiffDecoder decoder, FileHandle fh, vector[int64_t] offsets, 
+                vector[int64_t] read_lengths, vector[int64_t] indices, 
+                object output_fun, dict kwargs):
+        cdef TiffDecoderInstance self = cls()
+        self.decoder = decoder
+        self.fh = fh
+        self.offsets = offsets
+        self.read_lengths = read_lengths
+        cdef int64_t read_len, max_read_len = 0
+        for read_len in read_lengths:
+            if read_len > max_read_len:
+                max_read_len = read_len
+        self.max_read_len = max_read_len
+        self.indices = indices
+        self.output_fun = output_fun
+        if not callable(output_fun):
+            raise ValueError("output_fun must be callable")
+        self.kwargs = kwargs
+        return self
+    
+    def __call__(self):
+        """Process all items in batch."""
+        raise NotImplementedError("Subclass must implement __call__")
+
+cdef class TiffDecoderErrorInstance(TiffDecoderInstance):
+    """Instance for error decoder."""
+    
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderError decoder = <TiffDecoderError>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        
+        for i in range(n):
+            raise TiffFileError(decoder.error_message)
+
+cdef class TiffDecoderJpegInstance(TiffDecoderInstance):
+    """Instance for JPEG compressed segments."""
+
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderJpeg decoder = <TiffDecoderJpeg>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        cdef int64_t index, offset, read_len
+        cdef tuple segmentindex, shape
+        cdef object data
+        cdef bint _fullsize = self.kwargs.get('_fullsize', False)
+        cdef object jpegtables = self.kwargs.get('jpegtables', None)
+        cdef object jpegheader = self.kwargs.get('jpegheader', None)
+        
+        for i in range(n):
+            index = self.indices[i]
+            offset = self.offsets[i]
+            read_len = self.read_lengths[i]
+            
+            segmentindex, shape = decoder.get_indices_shape(index)
+            
+            if read_len <= 0:
+                if _fullsize:
+                    shape = decoder.pad_none(shape)
+                self.output_fun(None, segmentindex, shape)
+                continue
+                
+            data = self.fh.read_array(numpy.uint8, offset=offset, count=read_len)
+            
+            data_array = imagecodecs.jpeg_decode(
+                data,
+                bitspersample=decoder.page.bitspersample,
+                tables=self.jpegtables,
+                header=self.jpegheader,
+                colorspace=decoder.colorspace,
+                outcolorspace=decoder.outcolorspace,
+                shape=shape[1:3]
+            )
+            
+            data_array = decoder.reshape_data(data_array, segmentindex, shape)
+            
+            if _fullsize:
+                data_array, shape = decoder.pad_data(data_array, shape)
+            
+            self.output_fun(data_array, segmentindex, shape)
+
+cdef class TiffDecoderEerInstance(TiffDecoderInstance):
+    """Instance for EER compressed segments."""
+    
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderEer decoder = <TiffDecoderEer>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        cdef int64_t index, offset, read_len
+        cdef tuple segmentindex, shape
+        cdef object data
+        cdef bint _fullsize = self.kwargs.get('_fullsize', False)
+        
+        for i in range(n):
+            index = self.indices[i]
+            offset = self.offsets[i]
+            read_len = self.read_lengths[i]
+            
+            segmentindex, shape = decoder.get_indices_shape(index)
+            
+            if read_len <= 0:
+                if _fullsize:
+                    shape = decoder.pad_none(shape)
+                self.output_fun(None, segmentindex, shape)
+                continue
+                
+            data = self.fh.read_array(numpy.uint8, offset=offset, count=read_len)
+            
+            data_array = decoder.decompress(
+                data,
+                shape=shape[1:3],
+                rlebits=decoder.rlebits,
+                horzbits=decoder.horzbits,
+                vertbits=decoder.vertbits,
+                superres=False
+            )
+            
+            data_array = data_array.reshape(shape)
+            
+            self.output_fun(data_array, segmentindex, shape)
+
+cdef class TiffDecoderJetrawInstance(TiffDecoderInstance):
+    """Instance for Jetraw compressed segments."""
+    
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderJetraw decoder = <TiffDecoderJetraw>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        cdef int64_t index, offset, read_len
+        cdef tuple segmentindex, shape
+        cdef object data
+        cdef bint _fullsize = self.kwargs.get('_fullsize', False)
+        
+        for i in range(n):
+            index = self.indices[i]
+            offset = self.offsets[i]
+            read_len = self.read_lengths[i]
+            
+            segmentindex, shape = decoder.get_indices_shape(index)
+            
+            if read_len <= 0:
+                if _fullsize:
+                    shape = decoder.pad_none(shape)
+                self.output_fun(None, segmentindex, shape)
+                continue
+                
+            data = self.fh.read_array(numpy.uint8, offset=offset, count=read_len)
+            
+            data_array = numpy.zeros(shape, numpy.uint16)
+            decoder.decompress(data, out=data_array)
+            
+            self.output_fun(data_array, segmentindex, shape)
+
+cdef class TiffDecoderImageInstance(TiffDecoderInstance):
+    """Instance for image compressions."""
+    
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderImage decoder = <TiffDecoderImage>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        cdef int64_t index, offset, read_len
+        cdef tuple segmentindex, shape
+        cdef object data
+        cdef bint _fullsize = self.kwargs.get('_fullsize', False)
+        
+        for i in range(n):
+            index = self.indices[i]
+            offset = self.offsets[i]
+            read_len = self.read_lengths[i]
+            
+            segmentindex, shape = decoder.get_indices_shape(index)
+            
+            if read_len <= 0:
+                if _fullsize:
+                    shape = decoder.pad_none(shape)
+                self.output_fun(None, segmentindex, shape)
+                continue
+                
+            data = self.fh.read_array(numpy.uint8, offset=offset, count=read_len)
+            
+            data_array = decoder.decompress(data)
+            data_array = decoder.reshape_data(data_array, segmentindex, shape)
+            
+            if _fullsize:
+                data_array, shape = decoder.pad_data(data_array, shape)
+            
+            self.output_fun(data_array, segmentindex, shape)
+
+cdef class TiffDecoderBaseInstance(TiffDecoderInstance):
+    """Instance for other format decoders."""
+    
+    def __call__(self):
+        """Process all items in batch."""
+        cdef TiffDecoderBase decoder = <TiffDecoderBase>self.decoder
+        cdef size_t i
+        cdef size_t n = self.indices.size()
+        cdef int64_t index, offset, read_len, size
+        cdef tuple segmentindex, shape
+        cdef object data, data_array
+        cdef bint _fullsize = self.kwargs.get('_fullsize', False)
+
+        cdef object read_buf = numpy.empty((self.max_read_len), dtype=numpy.uint8)
+        cdef uint8_t[::1] read_buf_view = read_buf
+        
+        for i in range(n):
+            index = self.indices[i]
+            offset = self.offsets[i]
+            read_len = self.read_lengths[i]
+            
+            segmentindex, shape = decoder.get_indices_shape(index)
+
+            with nogil:
+                if read_len <= 0 or self.fh.read_into(&read_buf_view[0], offset, read_len) != read_len:
+                    with gil:
+                        if _fullsize:
+                            shape = decoder.pad_none(shape)
+                        self.output_fun(None, segmentindex, shape)
+                    continue
+            
+            data = read_buf[:read_len]
+            if decoder.fillorder == 2:
+                data = imagecodecs.bitorder_decode(data)
+                
+            if decoder.decompress is not None:
+                size = shape[0] * shape[1] * shape[2] * shape[3]
+                data = decoder.decompress(data, out=size * decoder.dtype.itemsize)
+                
+            data_array = decoder.unpack(data)
+            data_array = decoder.reshape_data(data_array, segmentindex, shape)
+            data_array = data_array.astype('=' + decoder.dtype.char, copy=False)
+            
+            if decoder.unpredict is not None:
+                data_array = decoder.unpredict(data_array, axis=-2, out=data_array)
+                
+            if _fullsize:
+                data_array, shape = decoder.pad_data(data_array, shape)
+                
+            self.output_fun(data_array, segmentindex, shape)
+
+# For the specialized base decoder instances, we can reuse the TiffDecoderBaseInstance since the main
+# difference is in the unpack method which is already handled in the base TiffDecoder classes
+cdef class TiffDecoderComplexIntInstance(TiffDecoderBaseInstance):
+    """Instance for complex integers."""
+    pass
+
+cdef class TiffDecoderRegularInstance(TiffDecoderBaseInstance):
+    """Instance for regular data types."""
+    pass
+
+cdef class TiffDecoderRGBInstance(TiffDecoderBaseInstance):
+    """Instance for RGB packed integers."""
+    pass
+
+cdef class TiffDecoderFloat24Instance(TiffDecoderBaseInstance):
+    """Instance for float24 data type."""
+    pass
+
+cdef class TiffDecoderPackedBitsInstance(TiffDecoderBaseInstance):
+    """Instance for bilevel and packed integers."""
+    pass

@@ -21,7 +21,7 @@ cdef struct TagHeader:
     int32_t count
     uint64_t value        # Raw uninterpreted value from tag
     uint64_t as_offset    # Value interpreted as an offset
-    TagValueUnion as_values[8]  # Array of values as int64_t or double
+    TagValueUnion[8] as_values  # Array of values as int64_t or double
 
 
 cdef class TiffFormat:
@@ -59,6 +59,9 @@ cdef class TiffFormat:
 
     cdef public int64_t tagoffsetthreshold
     """Size of inline tag values."""
+    
+    cdef public int64_t first_ifd_offset
+    """Offset to first IFD."""
 
     cdef int64_t _hash
     

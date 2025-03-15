@@ -327,9 +327,6 @@ cdef class TiffPage:
         self.subifds = None
         self.jpegtables = None
         self.jpegheader = None
-        self.software = ''
-        self.description = ''
-        self.description1 = ''
         self.nodata = 0
 
     @staticmethod
@@ -478,7 +475,6 @@ cdef class TiffPage:
         # tags that are processed as python objects require the gil
         if self.tags.contains_code(338) or self.tags.contains_code(530) or\
            self.tags.contains_code(330) or self.tags.contains_code(347) or\
-           self.tags.contains_code(270) or self.tags.contains_code(305) or\
            (self.subfiletype == 0 and self.tags.contains_code(255)):
             with gil:
                 self._process_common_tags_gil()
@@ -494,10 +490,6 @@ cdef class TiffPage:
 
         # Other tags
         self.jpegtables = tags.valueof(347, self.jpegtables, 0) # JPEGTables
-        self.description = tags.valueof(270, self.description, 0) # Description
-        self.software = tags.valueof(305, self.software, 0) # Software
-        self.description1 = tags.valueof(270, self.description1, 1) # Description1
-
         # Process SubfileType (legacy tag)
         if self.subfiletype == 0:
             value = tags.valueof(255, None, 0) # SubfileType
@@ -508,15 +500,15 @@ cdef class TiffPage:
 
     cdef void _process_special_format_tags(self) noexcept nogil:
         """Process tags specific to special file formats."""
-        # STK (MetaMorph) format
-        if self.tags.contains_code(33628):
-            with gil:
-                self._process_special_format_tags_stk()
+        # STK (MetaMorph) format TODO: Move to tags
+        #if self.tags.contains_code(33628):
+        #    with gil:
+        #        self._process_special_format_tags_stk()
 
-        # ImageJ metadata
-        if self.tags.contains_code(50839):
-            with gil:
-                self._process_special_format_tags_imagej()
+        # ImageJ metadata TODO: Move to tags
+        #if self.tags.contains_code(50839):
+        #    with gil:
+        #        self._process_special_format_tags_imagej()
 
         # BitsPerSample
         if self.bitspersample == 1 and self.tags.contains_code(258): # not OJPEG hack
@@ -819,14 +811,15 @@ cdef class TiffPage:
                 Invalid TIFF structure.
         """
         global CACHED_DECODERS
-        if self.hash() in CACHED_DECODERS:
-            return CACHED_DECODERS[self.hash()]
+        self_hash = self.hash()
+        if self_hash in CACHED_DECODERS:
+            return CACHED_DECODERS[self_hash]
         
         # Create the decoder using the factory method
         decoder = TiffDecoder.create(self)
         
         # Cache the decoder
-        CACHED_DECODERS[self.hash()] = decoder
+        CACHED_DECODERS[self_hash] = decoder
         
         return decoder
 
@@ -974,6 +967,7 @@ cdef class TiffPage:
             maxworkers = keyframe.maxworkers
         if buffersize is None:
             buffersize = -1
+        maxworkers = 4
 
         # Check if we need to open the file
         closed = fh.closed
@@ -1111,6 +1105,7 @@ cdef class TiffPage:
         )
         return result
 
+    '''
     cdef object _asarray_tiled(self, out, int64_t maxworkers, int64_t buffersize):
         """Return tiled/striped image data as NumPy array.
         
@@ -1175,6 +1170,124 @@ cdef class TiffPage:
         ):
             pass
             
+        return result
+    '''
+    cdef object _asarray_tiled(self, out, int64_t maxworkers, int64_t buffersize):
+        """Return tiled/striped image data as NumPy array.
+        
+        Process individual tiles or strips in batches using decoder instances,
+        potentially in parallel, and assemble them into a complete image.
+        
+        Parameters:
+            out: Output specification for the array.
+            maxworkers: Maximum number of worker threads.
+            buffersize: Size of buffer for reading data.
+            
+        Returns:
+            NumPy array of the assembled image data.
+        """
+        cdef TiffPage keyframe = self.keyframe
+        cdef vector[int64_t] segment_indices
+        cdef int64_t n_segments, segment_per_worker, i, k, start_idx, end_idx
+        cdef vector[int64_t] worker_segment_indices = vector[int64_t]()
+        cdef vector[int64_t] worker_segment_offsets = vector[int64_t]()
+        cdef vector[int64_t] worker_segment_bytecounts = vector[int64_t]()
+        cdef list batch_tasks
+
+        
+        # Initialize the decoder
+        cdef TiffDecoder decoder = keyframe.decode
+        
+        # Create output array
+        result = create_output(out, keyframe.shaped, keyframe._dtype)
+        
+        # Get segment data
+        n_segments = self._dataoffsets.size()
+        
+        if n_segments == 0:
+            return result
+        
+        # Create a function to copy decoded data to the output array
+        def copy_to_output(
+            data: NDArray[Any] | None,
+            indices: tuple[int, int, int, int, int], 
+            shape: tuple[int, int, int, int],
+            out: NDArray[Any] = result,
+            nodata = keyframe.nodata,
+        ) -> None:
+            """Copy decoded segment to output array."""
+            s, d, h, w, _ = indices
+            if data is None:
+                out[s, d : d + shape[0], h : h + shape[1], w : w + shape[2]] = nodata
+            else:
+                out[s, d : d + shape[0], h : h + shape[1], w : w + shape[2]] = data[
+                    : keyframe.imagedepth - d,
+                    : keyframe.imagelength - h,
+                    : keyframe.imagewidth - w,
+                ]
+        
+        # Set decode arguments
+        cdef dict decodeargs = {'_fullsize': False}
+        if keyframe.compression in {6, 7, 34892, 33007}:  # JPEG
+            decodeargs['jpegtables'] = self.jpegtables
+            decodeargs['jpegheader'] = keyframe.jpegheader
+        
+        if maxworkers < 2 or n_segments < 2:
+            # Process all segments in a single batch
+            segment_indices.reserve(n_segments)
+            for i in range(n_segments):
+                segment_indices.push_back(i)
+                
+            # Create a decoder instance for all segments
+            decoder_instance = decoder.get_instance(
+                self.fh, self._dataoffsets, self._databytecounts, 
+                segment_indices, copy_to_output, decodeargs
+            )
+            
+            # Process all segments
+            decoder_instance()
+        else:
+            # Determine segments per worker (at least 1)
+            segment_per_worker = max(1, (n_segments + maxworkers - 1) // maxworkers)
+            
+            # Create instances for processing segments in batches
+            batch_tasks = []
+            
+            # Assign segments to workers
+            for i in range(min(maxworkers, n_segments)):
+                start_idx = i * segment_per_worker
+                end_idx = min((i + 1) * segment_per_worker, n_segments)
+                
+                if start_idx >= end_idx:
+                    break
+                    
+                # Create segment indices for this batch
+                worker_segment_indices.clear()
+                worker_segment_offsets.clear()
+                worker_segment_bytecounts.clear()
+                
+                worker_segment_indices.reserve(end_idx - start_idx)
+                worker_segment_offsets.reserve(end_idx - start_idx)
+                worker_segment_bytecounts.reserve(end_idx - start_idx)
+                
+                for j in range(start_idx, end_idx):
+                    worker_segment_indices.push_back(j)
+                    worker_segment_offsets.push_back(self._dataoffsets[j])
+                    worker_segment_bytecounts.push_back(self._databytecounts[j])
+                
+                # Create a decoder instance for this batch of segments
+                decoder_instance = decoder.get_instance(
+                    self.fh, worker_segment_offsets, worker_segment_bytecounts, 
+                    worker_segment_indices, copy_to_output, decodeargs
+                )
+                
+                # Submit the batch to the thread pool
+                batch_tasks.append(THREADPOOL.submit(decoder_instance))
+            
+            # Wait for all batches to complete
+            for task in batch_tasks:
+                task.result()  # This will raise any exceptions that occurred
+                
         return result
 
     def asrgb(
@@ -1698,6 +1811,18 @@ cdef class TiffPage:
             and self.dtype is not None
             and self._dataoffsets[0] % self.dtype.itemsize == 0
         )
+
+    @property
+    def description(self) -> str:
+        return self.tags.valueof(270, '', 0)
+
+    @property
+    def description1(self) -> str:
+        return self.tags.valueof(270, '', 1)
+
+    @property
+    def software(self) -> str:
+        return self.tags.valueof(305, self.software, 0)
 
     @property
     def shaped_description(self) -> str | None:

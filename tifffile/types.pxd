@@ -41,7 +41,7 @@ cpdef enum DATATYPE:
     IFD8 = 18
     # Unsigned 8 byte IFD offset (BigTIFF)."""
 
-'''
+
 cpdef enum class COMPRESSION:
     """Values of Compression tag.
 
@@ -341,5 +341,3 @@ cpdef enum class CHUNKMODE:
     # Chunk is image in page."""
     FILE = 3
     # Chunk is image in file."""
-
-'''
