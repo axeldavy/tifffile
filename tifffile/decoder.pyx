@@ -1247,6 +1247,8 @@ cdef class TiffDecoderImageInstance(TiffDecoderInstance):
             
             self.output_fun(data_array, segmentindex, shape)
 
+import time
+
 cdef class TiffDecoderBaseInstance(TiffDecoderInstance):
     """Instance for other format decoders."""
     
@@ -1263,13 +1265,33 @@ cdef class TiffDecoderBaseInstance(TiffDecoderInstance):
         cdef object read_buf = numpy.empty((self.max_read_len), dtype=numpy.uint8)
         cdef uint8_t[::1] read_buf_view = read_buf
         
+        # Initialize timing dictionaries
+        cdef dict total_times = {
+            'read': 0.0,
+            'fillorder': 0.0,
+            'decompress': 0.0,
+            'unpack': 0.0,
+            'reshape': 0.0,
+            'astype': 0.0,
+            'unpredict': 0.0,
+            'pad': 0.0,
+            'output': 0.0,
+            'total': 0.0
+        }
+        
+        cdef double t_start = time.time()
+        cdef double t0, t1
+        
         for i in range(n):
             index = self.indices[i]
             offset = self.offsets[i]
             read_len = self.read_lengths[i]
             
+            t0 = time.time()
             segmentindex, shape = decoder.get_indices_shape(index)
-
+            
+            # Read data
+            t1 = time.time()
             with nogil:
                 if read_len <= 0 or self.fh.read_into(&read_buf_view[0], offset, read_len) != read_len:
                     with gil:
@@ -1277,26 +1299,72 @@ cdef class TiffDecoderBaseInstance(TiffDecoderInstance):
                             shape = decoder.pad_none(shape)
                         self.output_fun(None, segmentindex, shape)
                     continue
+            total_times['read'] += time.time() - t1
             
             data = read_buf[:read_len]
+            
+            # Apply bit order if needed
+            t1 = time.time()
             if decoder.fillorder == 2:
                 data = imagecodecs.bitorder_decode(data)
-                
+            total_times['fillorder'] += time.time() - t1
+            
+            # Decompress data if needed
+            t1 = time.time()
             if decoder.decompress is not None:
                 size = shape[0] * shape[1] * shape[2] * shape[3]
                 data = decoder.decompress(data, out=size * decoder.dtype.itemsize)
-                
-            data_array = decoder.unpack(data)
-            data_array = decoder.reshape_data(data_array, segmentindex, shape)
-            data_array = data_array.astype('=' + decoder.dtype.char, copy=False)
+            total_times['decompress'] += time.time() - t1
             
+            # Unpack data
+            t1 = time.time()
+            data_array = decoder.unpack(data)
+            total_times['unpack'] += time.time() - t1
+            
+            # Reshape data
+            t1 = time.time()
+            data_array = decoder.reshape_data(data_array, segmentindex, shape)
+            total_times['reshape'] += time.time() - t1
+            
+            # Convert data type if needed
+            t1 = time.time()
+            data_array = data_array.astype('=' + decoder.dtype.char, copy=False)
+            total_times['astype'] += time.time() - t1
+            
+            # Apply unprediction if needed
+            t1 = time.time()
             if decoder.unpredict is not None:
                 data_array = decoder.unpredict(data_array, axis=-2, out=data_array)
-                
+            total_times['unpredict'] += time.time() - t1
+            
+            # Pad data if needed
+            t1 = time.time()
             if _fullsize:
                 data_array, shape = decoder.pad_data(data_array, shape)
-                
+            total_times['pad'] += time.time() - t1
+            
+            # Pass to output function
+            t1 = time.time()
             self.output_fun(data_array, segmentindex, shape)
+            total_times['output'] += time.time() - t1
+        
+        # Calculate total time
+        total_times['total'] = time.time() - t_start
+        
+        # Print timing information
+        '''
+        print("TiffDecoderBaseInstance timing statistics:")
+        print(f"Total time: {total_times['total']:.6f}s")
+        print(f"  Reading data: {total_times['read']:.6f}s ({100*total_times['read']/total_times['total']:.2f}%)")
+        print(f"  Bit order correction: {total_times['fillorder']:.6f}s ({100*total_times['fillorder']/total_times['total']:.2f}%)")
+        print(f"  Decompression: {total_times['decompress']:.6f}s ({100*total_times['decompress']/total_times['total']:.2f}%)")
+        print(f"  Unpacking: {total_times['unpack']:.6f}s ({100*total_times['unpack']/total_times['total']:.2f}%)")
+        print(f"  Reshaping: {total_times['reshape']:.6f}s ({100*total_times['reshape']/total_times['total']:.2f}%)")
+        print(f"  Type conversion: {total_times['astype']:.6f}s ({100*total_times['astype']/total_times['total']:.2f}%)")
+        print(f"  Unprediction: {total_times['unpredict']:.6f}s ({100*total_times['unpredict']/total_times['total']:.2f}%)")
+        print(f"  Padding: {total_times['pad']:.6f}s ({100*total_times['pad']/total_times['total']:.2f}%)")
+        print(f"  Output processing: {total_times['output']:.6f}s ({100*total_times['output']/total_times['total']:.2f}%)")
+        '''
 
 # For the specialized base decoder instances, we can reuse the TiffDecoderBaseInstance since the main
 # difference is in the unpack method which is already handled in the base TiffDecoder classes

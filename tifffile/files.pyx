@@ -290,6 +290,11 @@ cdef class FileHandle:
         self._name = os.path.basename(file) if not name else name
         self._dir = os.path.dirname(os.path.abspath(file))
         self.open()
+
+    def __dealloc__(self):
+        if self._cfh != NULL:
+            fclose(self._cfh)
+            self._cfh = NULL
         
     cpdef void open(self):
         """Open or re-open file using C file operations."""

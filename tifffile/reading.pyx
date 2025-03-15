@@ -124,7 +124,9 @@ cdef class TiffFile:
         """Close open file handle(s)."""
         #for tif in self._files.values():
         #    tif.filehandle.close()
-        self.fh.close()
+        #if self.fh is not None:
+        #    self.fh.close()
+        #    self.fh = None
 
     def asarray(
         self,
