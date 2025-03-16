@@ -729,6 +729,11 @@ cdef class CustomTiffReader:
             if not self._parse_data_for_reading(cur_page_offset):
                 raise ValueError("Failed to parse page tags")
 
+            if stop_x == 0:
+                stop_x = self.image_width
+            if stop_y == 0:
+                stop_y = self.image_length
+
             if not (stop_x > start_x and stop_x <= self.image_width and
                     stop_y > start_y and stop_y <= self.image_length):
                 raise ValueError(f"Invalid crop area, requested ({start_x}, {start_y}) to ({stop_x}, {stop_y}), image is ({self.image_width}, {self.image_length})")
@@ -753,6 +758,51 @@ cdef class CustomTiffReader:
             output_array.data = <char*>dst_ptr
             output_array.callback_free_data = free
         return output_array
+
+    cpdef tuple get_image_dimensions(self, str path, int page):
+        """
+        Returns the image dimensions of the designated page
+        (height, width)
+        """
+        cdef:
+            string path_str
+            uint32_t first_page_offset
+            uint32_t cur_page_offset
+            uint32_t cur_page
+
+        path_str = path.encode('utf-8')
+        
+        with nogil:
+            if not self._open(path_str):
+                with gil:
+                    raise ValueError("Failed to open file")
+
+            fseek(self.file_handle, 0, SEEK_END)
+            self.file_size = ftell(self.file_handle)
+            if self.file_size == -1:
+                with gil:
+                    raise ValueError("Failed to get file size")
+            if not self._check_header():
+                with gil:
+                    raise ValueError("Unsupported TIFF header")
+
+            first_page_offset = self._get_offset_first_page()
+            cur_page_offset = first_page_offset
+            cur_page = 0
+            while cur_page < page:
+                cur_page_offset = self._get_offset_next_page(cur_page_offset)
+                if cur_page_offset == 0:
+                    with gil:
+                        raise ValueError(f"Requested page not found, only {cur_page} pages found")
+                cur_page += 1
+
+            if not self._parse_data_for_reading(cur_page_offset):
+                with gil:
+                    raise ValueError("Failed to parse page tags")
+        
+        # Return dimensions as (height, width)
+        return (self.image_length, self.image_width)
+
 
 
 
