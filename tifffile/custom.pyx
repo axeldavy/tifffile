@@ -12,11 +12,7 @@ from libc.string cimport memcpy
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 from libc.stdlib cimport malloc, free
-
-from posix.mman cimport mmap, munmap, PROT_READ, MAP_PRIVATE, MAP_FAILED
-from posix.unistd cimport close
-from posix.fcntl cimport O_RDONLY, open as open_file
-from posix.stat cimport struct_stat, fstat
+from libc.stdio cimport FILE, fopen, fclose, fread, fseek, ftell, SEEK_SET, SEEK_END, SEEK_CUR
 
 cimport cython
 
@@ -175,12 +171,14 @@ cdef extern from * nogil:
 @cython.final
 cdef class CustomTiffReader:
     """
-    A reader with state, uses mmap to open the file
+    A reader with state that efficiently reads TIFF files
+    using targeted file access.
 
     Not thread safe.
     """
 
-    cdef void* mmap_ptr
+    cdef FILE* file_handle
+    cdef int64_t file_size
 
     # page information
     cdef vector[uint32_t] databytecounts
@@ -198,14 +196,15 @@ cdef class CustomTiffReader:
 
 
     def __cinit__(self):
-        self.mmap_ptr = NULL
+        self.file_handle = NULL
         self.zstd_dctx = ZSTD_createDCtx()
         if self.zstd_dctx == NULL:
             raise MemoryError("Failed to create ZSTD decompression context")
 
     def __dealloc__(self):
-        if self.mmap_ptr != NULL:
-            munmap(self.mmap_ptr, 0)
+        if self.file_handle != NULL:
+            fclose(self.file_handle)
+            self.file_handle = NULL
         
         # Free ZSTD context
         if self.zstd_dctx != NULL:
@@ -213,34 +212,26 @@ cdef class CustomTiffReader:
 
     cdef bint _open(self, string &path) noexcept nogil:
         """
-        Opens the target file with mmap
+        Opens the target file using standard C file I/O
         """
-        cdef struct_stat st
-
-        # Unmap any previous file
-        if self.mmap_ptr != NULL:
-            munmap(self.mmap_ptr, 0)
-            self.mmap_ptr = NULL
-        cdef int fd = open_file(path.c_str(), O_RDONLY)
-        if fd == -1:
-            return False
-
-        if fstat(fd, &st) == -1:
-            close(fd)
-            return False
-
-        self.mmap_ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)
-        close(fd)
-        if self.mmap_ptr == MAP_FAILED:
-            self.mmap_ptr = NULL
-            return False
-        return True
+        # Close previously opened file
+        if self.file_handle != NULL:
+            fclose(self.file_handle)
+            self.file_handle = NULL
+            
+        # Open the file
+        self.file_handle = fopen(path.c_str(), "rb")
+        return self.file_handle != NULL
 
     cdef bint _check_header(self) noexcept nogil:
         """
         Check the header is classic tiff little-endian
         """
-        cdef TiffHeader* header = <TiffHeader*>self.mmap_ptr
+        cdef TiffHeader header
+
+        fseek(self.file_handle, 0, SEEK_SET)
+        if fread(&header, sizeof(TiffHeader), 1, self.file_handle) != 1:
+            return False
 
         if header.byteOrder[0] != header.byteOrder[1] and\
            header.byteOrder[0] != 73: # 'I'
@@ -251,7 +242,10 @@ cdef class CustomTiffReader:
         """
         Retrieve from the header the offset to the first page
         """
-        cdef TiffHeader* header = <TiffHeader*>self.mmap_ptr
+        cdef TiffHeader header
+
+        fseek(self.file_handle, 0, SEEK_SET)
+        fread(&header, sizeof(TiffHeader), 1, self.file_handle)
         return header.firstIFDOffset
 
     cdef uint32_t _get_offset_next_page(self, uint32_t cur_page_offset) noexcept nogil:
@@ -259,22 +253,36 @@ cdef class CustomTiffReader:
         Assuming cur_page_offset points to a page, skips the tags
         and retrieve the offset to the next page and returns it
         """
-        cdef IFDHeader* header = <IFDHeader*>(<char*>self.mmap_ptr + cur_page_offset)
-        cdef uint16_t num_tags = header.numEntries
-        cdef TiffTag* tags = <TiffTag*>(<char*>self.mmap_ptr + cur_page_offset + sizeof(IFDHeader))
-        
+        cdef IFDHeader header
+
+        fseek(self.file_handle, cur_page_offset, SEEK_SET)
+        if fread(&header, sizeof(IFDHeader), 1, self.file_handle) != 1:
+            return 0
+
+        # Skip the tags
+        fseek(self.file_handle, header.numEntries * sizeof(TiffTag), SEEK_CUR)
+
         # Next IFD offset is stored after all the tag entries
-        cdef uint32_t* next_ifd_ptr = <uint32_t*>(<char*>tags + num_tags * sizeof(TiffTag))
-        return next_ifd_ptr[0]  # Return the offset to the next IFD, 0 if this is the last one
+        cdef uint32_t next_ifd_offset
+        if fread(&next_ifd_offset, sizeof(uint32_t), 1, self.file_handle) != 1:
+            return 0
+        return next_ifd_offset  # Return the offset to the next IFD, 0 if this is the last one
 
     cdef bint _parse_data_for_reading(self, uint32_t page_offset) noexcept nogil:
         """
         Go through the page tags and retrieves the values of the tags that
         matter for our usage
         """
-        cdef IFDHeader* header = <IFDHeader*>(<char*>self.mmap_ptr + page_offset)
+        cdef IFDHeader header
+
+        fseek(self.file_handle, page_offset, SEEK_SET)
+        if fread(&header, sizeof(IFDHeader), 1, self.file_handle) != 1:
+            return False
+
         cdef uint16_t num_tags = header.numEntries
-        cdef TiffTag* tags = <TiffTag*>(<char*>self.mmap_ptr + page_offset + sizeof(IFDHeader))
+        cdef TiffTag* tags = <TiffTag*>malloc(num_tags * sizeof(TiffTag))
+        if fread(tags, num_tags * sizeof(TiffTag), 1, self.file_handle) != 1:
+            return False
 
         # We rely on the fact indices are support to only go increasing
         # image_width: 256 (ImageWidth)
@@ -361,7 +369,12 @@ cdef class CustomTiffReader:
         if tags[0].count == 1:
             self.dataoffsets[0] = tags[0].value.offset
         else:
-            memcpy(&self.dataoffsets[0], <char*>self.mmap_ptr + tags[0].value.offset, tags[0].count * sizeof(uint32_t))
+            fseek(self.file_handle, tags[0].value.offset, SEEK_SET)
+            if fread(&self.dataoffsets[0],
+                     tags[0].count * sizeof(uint32_t),
+                     1,
+                     self.file_handle) != 1:
+                return False
         tags += 1
         num_tags -= 1
 
@@ -374,7 +387,12 @@ cdef class CustomTiffReader:
         if tags[0].count == 1:
             self.databytecounts[0] = tags[0].value.offset
         else:
-            memcpy(&self.databytecounts[0], <char*>self.mmap_ptr + tags[0].value.offset, tags[0].count * sizeof(uint32_t))
+            fseek(self.file_handle, tags[0].value.offset, SEEK_SET)
+            if fread(&self.databytecounts[0],
+                     tags[0].count * sizeof(uint32_t),
+                     1,
+                     self.file_handle) != 1:
+                return False
         tags += 1
         num_tags -= 1
 
@@ -468,6 +486,16 @@ cdef class CustomTiffReader:
             free(output_buffer)
             return NULL
 
+        # Allocate buffer for compressed data,
+        cdef size_t compressed_data_size = 0
+        for tile_bytecount in self.databytecounts:
+            compressed_data_size = max(tile_bytecount, compressed_data_size)
+        compressed_data = <uint8_t*>malloc(compressed_data_size)
+        if compressed_data == NULL:
+            free(decompressed_data)
+            free(output_buffer)
+            return NULL
+
         # Process each relevant tile
         for this_tile_y in range(start_tile_y, end_tile_y):
             for this_tile_x in range(start_tile_x, end_tile_x):
@@ -484,8 +512,12 @@ cdef class CustomTiffReader:
                     if tile_bytecount == 0:
                         continue
                     
-                    # Get pointer to compressed data
-                    compressed_data = <uint8_t*>self.mmap_ptr + tile_offset
+                    # Retrieve compressed data
+                    fseek(self.file_handle, tile_offset, SEEK_SET)
+                    if fread(compressed_data, tile_bytecount, 1, self.file_handle) != 1:
+                        free(decompressed_data)
+                        free(output_buffer)
+                        return NULL
                             
                     # Decompress data directly using ZSTD
                     result = ZSTD_decompressDCtx(
@@ -534,6 +566,7 @@ cdef class CustomTiffReader:
                     
         # Cleanup
         free(decompressed_data)
+        free(compressed_data)
 
         return output_buffer
 
@@ -580,6 +613,16 @@ cdef class CustomTiffReader:
             free(output_buffer)
             return NULL
 
+        # Allocate buffer for compressed data,
+        cdef size_t compressed_data_size = 0
+        for tile_bytecount in self.databytecounts:
+            compressed_data_size = max(tile_bytecount, compressed_data_size)
+        compressed_data = <uint8_t*>malloc(compressed_data_size)
+        if compressed_data == NULL:
+            free(decompressed_data)
+            free(output_buffer)
+            return NULL
+
         # Process each relevant tile
         for this_tile_y in range(start_tile_y, end_tile_y):
             for this_tile_x in range(start_tile_x, end_tile_x):
@@ -596,8 +639,12 @@ cdef class CustomTiffReader:
                     if tile_bytecount == 0:
                         continue
                     
-                    # Get pointer to compressed data
-                    compressed_data = <uint8_t*>self.mmap_ptr + tile_offset
+                    # Retrieve compressed data
+                    fseek(self.file_handle, tile_offset, SEEK_SET)
+                    if fread(compressed_data, tile_bytecount, 1, self.file_handle) != 1:
+                        free(decompressed_data)
+                        free(output_buffer)
+                        return NULL
     
                     # Decompress data directly using ZSTD
                     result = ZSTD_decompressDCtx(
@@ -639,6 +686,7 @@ cdef class CustomTiffReader:
                     
         # Cleanup
         free(decompressed_data)
+        free(compressed_data)
 
         return <void*>output_buffer
 
@@ -661,6 +709,11 @@ cdef class CustomTiffReader:
         with nogil:
             if not self._open(path_str):
                 raise ValueError("Failed to open file")
+
+            fseek(self.file_handle, 0, SEEK_END)
+            self.file_size = ftell(self.file_handle)
+            if self.file_size == -1:
+                raise ValueError("Failed to get file size")
             if not self._check_header():
                 raise ValueError("Unsupported TIFF header")
 
