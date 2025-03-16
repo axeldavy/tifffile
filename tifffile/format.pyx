@@ -84,6 +84,7 @@ cdef class TiffFormat:
             ByteOrder byteorder
             int64_t version
             uint64_t ifd_offset
+            TiffFormat result
         
         # Minimum header size required: 8 bytes
         if len(header) < 8:
@@ -123,29 +124,63 @@ cdef class TiffFormat:
                     # Check for the NDPI signature: high offset bytes are non-zero
                     # and offset is reasonable (not extremely large)
                     if (data[8] | data[9] | data[10] | data[11]) and ifd_offset < 0x20000000:
-                        return TiffFormatNDPI_LE()
-                        
+                        result = TiffFormatNDPI_LE()
+                        result.first_ifd_offset = ifd_offset
+                        return result
+            
             # Regular 32-bit TIFF
             if byteorder == ByteOrder.II:
-                return TiffFormatClassicLE()
+                # Parse 4-byte offset
+                ifd_offset = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24)
+                result = TiffFormatClassicLE()
+                result.first_ifd_offset = ifd_offset
             else:
-                return TiffFormatClassicBE()
+                # Parse 4-byte offset (big endian)
+                ifd_offset = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7]
+                result = TiffFormatClassicBE()
+                result.first_ifd_offset = ifd_offset
+            return result
                 
         elif version == 43:  # BigTIFF
             # Verify BigTIFF structure (bytesize should be 8, always stored as 2 bytes)
-            if len(header) >= 10:
+            if len(header) >= 16:
                 bytesize = data[4] | (data[5] << 8) if byteorder == ByteOrder.II else (data[4] << 8) | data[5]
                 reserved = data[6] | (data[7] << 8) if byteorder == ByteOrder.II else (data[6] << 8) | data[7]
                 
                 if bytesize != 8 or reserved != 0:
                     raise ValueError("Invalid BigTIFF header")
+                
+                # Parse 8-byte offset
+                if byteorder == ByteOrder.II:
+                    ifd_offset = (
+                        <uint64_t>data[8] | 
+                        (<uint64_t>data[9] << 8) | 
+                        (<uint64_t>data[10] << 16) | 
+                        (<uint64_t>data[11] << 24) | 
+                        (<uint64_t>data[12] << 32) | 
+                        (<uint64_t>data[13] << 40) | 
+                        (<uint64_t>data[14] << 48) | 
+                        (<uint64_t>data[15] << 56)
+                    )
+                    result = TiffFormatBigLE()
+                    result.first_ifd_offset = ifd_offset
+                else:
+                    ifd_offset = (
+                        (<uint64_t>data[8] << 56) |
+                        (<uint64_t>data[9] << 48) |
+                        (<uint64_t>data[10] << 40) |
+                        (<uint64_t>data[11] << 32) |
+                        (<uint64_t>data[12] << 24) |
+                        (<uint64_t>data[13] << 16) |
+                        (<uint64_t>data[14] << 8) |
+                        (<uint64_t>data[15])
+                    )
+                    result = TiffFormatBigBE()
+                    result.first_ifd_offset = ifd_offset
                     
-            if byteorder == ByteOrder.II:
-                return TiffFormatBigLE()
-            else:
-                return TiffFormatBigBE()
-        else:
-            raise ValueError(f"Unsupported TIFF version: {version}")
+                return result
+                
+        raise ValueError(f"Unsupported TIFF version: {version}")
 
 cdef class TiffFormatClassicLE(TiffFormat):
     """32-bit little-endian TIFF format."""
@@ -161,6 +196,7 @@ cdef class TiffFormatClassicLE(TiffFormat):
         self.tagformat1 = '<HH'
         self.tagformat2 = '<I4s'
         self.tagoffsetthreshold = 4
+        self.first_ifd_offset = 0
         self._hash = hash((self.version, int(self.byteorder), self.offsetsize))
         
     cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil:
@@ -281,6 +317,7 @@ cdef class TiffFormatClassicBE(TiffFormat):
         self.tagformat1 = '>HH'
         self.tagformat2 = '>I4s'
         self.tagoffsetthreshold = 4
+        self.first_ifd_offset = 0
         self._hash = hash((self.version, int(self.byteorder), self.offsetsize))
         
     cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil:
@@ -403,6 +440,7 @@ cdef class TiffFormatBigLE(TiffFormat):
         self.tagformat1 = '<HH'
         self.tagformat2 = '<Q8s'
         self.tagoffsetthreshold = 8
+        self.first_ifd_offset = 0
         self._hash = hash((self.version, int(self.byteorder), self.offsetsize))
         
     cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil:
@@ -576,6 +614,7 @@ cdef class TiffFormatBigBE(TiffFormat):
         self.tagformat1 = '>HH'
         self.tagformat2 = '>Q8s'
         self.tagoffsetthreshold = 8
+        self.first_ifd_offset = 0
         self._hash = hash((self.version, int(self.byteorder), self.offsetsize))
         
     cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil:
@@ -766,6 +805,7 @@ cdef class TiffFormatNDPI_LE(TiffFormat):
         self.tagformat1 = '<HH'
         self.tagformat2 = '<I8s'
         self.tagoffsetthreshold = 4
+        self.first_ifd_offset = 0
         self._hash = hash((self.version, int(self.byteorder), self.offsetsize))
         
     cdef void parse_tag_headers(self, vector[TagHeader] &v, const uint8_t* data, int64_t data_len) noexcept nogil:
